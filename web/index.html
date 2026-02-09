@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Putting Simulator</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #14171c; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    pointer-events: none; font-family: 'Courier New', monospace;
+    color: #ebebeb; font-size: 13px;
+  }
+  #stats {
+    position: absolute; top: 10px; left: 10px;
+    line-height: 1.5; font-size: 26px; white-space: pre-line;
+  }
+  #help {
+    position: absolute; top: 10px; right: 10px;
+    text-align: right; line-height: 1.5;
+  }
+  #help .help-line { transition: color 0.15s, font-weight 0.15s; }
+  #help .help-line.highlight { color: #ffe033; font-weight: bold; }
+  #message {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    font-size: 42px; font-weight: bold; color: #dc1e1e;
+    display: none; white-space: nowrap;
+  }
+  @media (pointer: coarse) { #help { display: none; } }
+
+  /* ---- Shoot button ---- */
+  #shoot-btn {
+    position: absolute; bottom: 30px; right: 30px;
+    width: 90px; height: 90px; border-radius: 50%;
+    border: 3px solid #ffe033;
+    background: rgba(220, 30, 30, 0.85); color: #fff;
+    font-family: 'Courier New', monospace; font-size: 16px; font-weight: bold;
+    cursor: pointer; pointer-events: auto; z-index: 20;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent; user-select: none;
+  }
+  #shoot-btn:active { background: rgba(220, 30, 30, 1.0); transform: scale(0.93); }
+
+  /* ---- Action buttons ---- */
+  #action-btns {
+    position: absolute; bottom: 20px; left: 20px;
+    display: flex; flex-direction: column; gap: 8px;
+    pointer-events: auto; z-index: 20;
+  }
+  #action-btns button {
+    padding: 10px 16px;
+    border: 1px solid rgba(255,255,255,0.3); border-radius: 6px;
+    background: rgba(20, 23, 28, 0.8); color: #ebebeb;
+    font-family: 'Courier New', monospace; font-size: 13px;
+    cursor: pointer; touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent; user-select: none; white-space: nowrap;
+  }
+  #action-btns button:active { background: rgba(60, 65, 75, 0.9); }
+
+  /* ---- Slider panel ---- */
+  #slider-panel {
+    position: absolute; top: 50%; right: 0; transform: translateY(-50%);
+    z-index: 20; pointer-events: auto;
+    display: flex; flex-direction: row; align-items: stretch;
+    transition: transform 0.25s ease;
+  }
+  #slider-panel.collapsed {
+    transform: translateY(-50%) translateX(calc(100% - 36px));
+  }
+  #slider-panel.collapsed #slider-content { pointer-events: none; opacity: 0; }
+  #slider-toggle {
+    width: 36px; min-height: 120px;
+    border: 1px solid rgba(255,255,255,0.2); border-right: none;
+    border-radius: 8px 0 0 8px;
+    background: rgba(20, 23, 28, 0.85); color: #ebebeb;
+    font-size: 18px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent; user-select: none;
+  }
+  #slider-content {
+    width: 220px; padding: 14px 12px;
+    background: rgba(20, 23, 28, 0.9);
+    border: 1px solid rgba(255,255,255,0.15);
+    display: flex; flex-direction: column; gap: 12px;
+    touch-action: none; transition: opacity 0.2s;
+  }
+  #slider-content label { display: flex; flex-direction: column; gap: 4px; }
+  .slider-label {
+    font-family: 'Courier New', monospace; font-size: 12px; color: #ebebeb;
+  }
+  #slider-content input[type="range"] {
+    width: 100%; height: 28px; accent-color: #ffe033;
+    touch-action: none; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div id="stats"></div>
+  <div id="message">IN THE HOLE!</div>
+  <div id="help">
+    <span class="help-line" data-keys="ArrowUp,ArrowDown">UP/DOWN: slope</span><br>
+    <span class="help-line" data-keys="x,X,y,Y">X/Y: stimp</span><br>
+    <span class="help-line" data-keys="q,Q,w,W">Q/W: true roll</span><br>
+    <span class="help-line" data-keys=" ">SPACE: shoot</span><br>
+    <span class="help-line" data-keys="1,2">1/2: start distance</span><br>
+    <span class="help-line" data-keys="3,4">3/4: launch angle</span><br>
+    <span class="help-line" data-keys="z,Z,u,U">Z/U: zoom</span><br>
+    <span class="help-line" data-keys="drag">drag: orbit camera</span><br>
+    <span class="help-line" data-keys="ctrl+drag">ctrl+drag: pan camera</span><br>
+    <span class="help-line" data-keys="wheel">wheel: camera height</span><br>
+    <span class="help-line" data-keys="f,F">F: cycle fall lines</span><br>
+    <span class="help-line" data-keys="b,B">B: reset camera view</span><br>
+    <span class="help-line" data-keys="r,R">R: reset ball</span><br>
+    <span class="help-line" data-keys="shift+R">shift+R: new terrain</span><br>
+    <span class="help-line" data-keys="h,H">H: toggle help</span>
+  </div>
+</div>
+
+<button id="shoot-btn">SHOOT</button>
+
+<div id="action-btns">
+  <button data-action="reset">Reset</button>
+  <button data-action="newTerrain">New Terrain</button>
+  <button data-action="cycleFlow">Flow</button>
+  <button data-action="resetCam">Camera</button>
+</div>
+
+<div id="slider-panel" class="collapsed">
+  <button id="slider-toggle">&laquo;</button>
+  <div id="slider-content">
+    <label>
+      <span class="slider-label">Slope <span id="val-angle">0.0</span>&deg;</span>
+      <input type="range" id="sl-angle" min="-5" max="5" step="0.1" value="0">
+    </label>
+    <label>
+      <span class="slider-label">Stimp <span id="val-stimp">3.0</span>m</span>
+      <input type="range" id="sl-stimp" min="1.0" max="6.0" step="0.1" value="3.0">
+    </label>
+    <label>
+      <span class="slider-label">True Roll <span id="val-troll">1.0</span></span>
+      <input type="range" id="sl-troll" min="0" max="20" step="0.1" value="1.0">
+    </label>
+    <label>
+      <span class="slider-label">Distance <span id="val-dist">3.0</span>m</span>
+      <input type="range" id="sl-dist" min="1.0" max="5.5" step="0.5" value="3.0">
+    </label>
+    <label>
+      <span class="slider-label">Launch <span id="val-launch">5</span>&deg;</span>
+      <input type="range" id="sl-launch" min="-4" max="15" step="1" value="5">
+    </label>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
