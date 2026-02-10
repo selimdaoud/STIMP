@@ -15,7 +15,7 @@
   }
   #stats {
     position: absolute; top: 10px; left: 10px;
-    line-height: 1.5; font-size: 26px; white-space: pre-line;
+    line-height: 1.5; font-size: 13px; white-space: pre-line;
   }
   #help {
     position: absolute; top: 10px; right: 10px;
@@ -93,6 +93,86 @@
     width: 100%; height: 28px; accent-color: #ffe033;
     touch-action: none; cursor: pointer;
   }
+
+  /* ---- Game mode ---- */
+  #game-hud {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    font-family: 'Courier New', monospace; font-weight: bold;
+    color: #ffe033; white-space: nowrap; pointer-events: none; display: none; z-index: 25;
+    text-align: center;
+  }
+  #game-hud .game-info { font-size: 22px; }
+  #scorecard {
+    display: flex; gap: 2px; justify-content: center; margin-top: 6px;
+  }
+  #scorecard .sc-hole {
+    display: flex; flex-direction: column; align-items: center;
+    min-width: 28px; font-size: 11px; line-height: 1.4;
+  }
+  #scorecard .sc-hole .sc-num { color: #ebebeb; font-weight: normal; }
+  #scorecard .sc-hole .sc-pts { color: #ffe033; }
+  #scorecard .sc-hole.current .sc-num { color: #ffe033; }
+  #scorecard .sc-hole.future .sc-pts { color: rgba(235,235,235,0.3); }
+  #scorecard .sc-total {
+    display: flex; flex-direction: column; align-items: center;
+    min-width: 36px; font-size: 11px; line-height: 1.4;
+    margin-left: 6px; border-left: 1px solid rgba(255,255,255,0.3); padding-left: 8px;
+  }
+  #scorecard .sc-total .sc-num { color: #ebebeb; font-weight: normal; }
+  #scorecard .sc-total .sc-pts { color: #ffe033; }
+  #score-popup {
+    position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%);
+    font-family: 'Courier New', monospace; font-size: 48px; font-weight: bold;
+    color: #fff; pointer-events: none; display: none; z-index: 30;
+    text-shadow: 0 0 20px rgba(255,224,51,0.8);
+  }
+  #score-popup.show {
+    display: block;
+    animation: popupFade 2.5s ease-out forwards;
+  }
+  @keyframes popupFade {
+    0% { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
+    15% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); }
+    30% { transform: translate(-50%, -50%) scale(1.0); }
+    70% { opacity: 1; }
+    100% { opacity: 0; transform: translate(-50%, -60%) scale(1.0); }
+  }
+  #game-over {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.75); display: none; z-index: 40;
+    justify-content: center; align-items: center;
+    font-family: 'Courier New', monospace;
+  }
+  #game-over.show { display: flex; }
+  #game-over-inner {
+    background: rgba(20, 23, 28, 0.95); border: 2px solid #ffe033;
+    border-radius: 12px; padding: 40px 60px; text-align: center;
+    color: #ebebeb;
+  }
+  #game-final-score { font-size: 36px; font-weight: bold; color: #ffe033; margin-bottom: 12px; }
+  #game-grade { font-size: 22px; margin-bottom: 30px; }
+  #game-over-inner button {
+    padding: 12px 24px; margin: 0 8px;
+    border: 1px solid rgba(255,255,255,0.3); border-radius: 6px;
+    background: rgba(220, 30, 30, 0.85); color: #fff;
+    font-family: 'Courier New', monospace; font-size: 16px; font-weight: bold;
+    cursor: pointer; touch-action: manipulation; user-select: none;
+  }
+  #game-over-inner button:active { background: rgba(220, 30, 30, 1.0); }
+  #game-exit-btn {
+    background: rgba(60, 65, 75, 0.85) !important;
+  }
+  #game-exit-live {
+    position: absolute; bottom: 20px; left: 20px;
+    padding: 10px 16px;
+    border: 1px solid rgba(255,255,255,0.3); border-radius: 6px;
+    background: rgba(60, 65, 75, 0.85); color: #ebebeb;
+    font-family: 'Courier New', monospace; font-size: 13px;
+    cursor: pointer; pointer-events: auto; z-index: 20;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent; user-select: none;
+    display: none;
+  }
+  #game-exit-live:active { background: rgba(90, 95, 105, 0.9); }
 </style>
 </head>
 <body>
@@ -125,7 +205,24 @@
   <button data-action="newTerrain">New Terrain</button>
   <button data-action="cycleFlow">Flow</button>
   <button data-action="resetCam">Camera</button>
+  <button data-action="startGame">Play</button>
 </div>
+
+<div id="game-hud">
+  <div class="game-info"><span id="game-hole">Hole 1/9</span></div>
+  <div id="scorecard"></div>
+</div>
+<div id="score-popup"></div>
+<div id="game-over">
+  <div id="game-over-inner">
+    <div id="game-final-score"></div>
+    <div id="game-grade"></div>
+    <button id="game-play-again">Play Again</button>
+    <button id="game-exit-btn">Exit</button>
+  </div>
+</div>
+
+<button id="game-exit-live">Exit Game</button>
 
 <div id="slider-panel" class="collapsed">
   <button id="slider-toggle">&laquo;</button>

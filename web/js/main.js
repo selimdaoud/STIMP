@@ -278,6 +278,27 @@ let shotAimPoints = [];
 let validAimPts = []; // blue aim points for GoodAimZone
 let lastShotStartPos = null; // ball position when last shot was fired
 
+// Game mode state
+let gameState = null; // null = free play, 'putting', 'moving', 'reveal', 'gameover'
+let gameHoleIndex = 0;
+let gameScore = 0;
+let gameCrossedHole = false;
+let gameStartPos = null; // ball position at start of hole for reveal
+let gameHoleScores = []; // per-hole scores
+const GAME_OOB_DIST = 6.0; // ball too far from hole = lost
+
+const GAME_HOLES = [
+    { slope: 1.0, stimp: 3.0, trueRoll: 0.0, distance: 2.0, seed: 1001 },
+    { slope: 1.5, stimp: 3.0, trueRoll: 0.5, distance: 2.5, seed: 1002 },
+    { slope: 2.0, stimp: 3.5, trueRoll: 0.5, distance: 3.0, seed: 1003 },
+    { slope: 2.5, stimp: 3.5, trueRoll: 1.0, distance: 3.0, seed: 1004 },
+    { slope: 3.0, stimp: 4.0, trueRoll: 1.0, distance: 3.5, seed: 1005 },
+    { slope: 3.0, stimp: 4.5, trueRoll: 1.5, distance: 3.5, seed: 1006 },
+    { slope: 3.5, stimp: 5.0, trueRoll: 1.5, distance: 4.0, seed: 1007 },
+    { slope: 4.0, stimp: 5.5, trueRoll: 2.0, distance: 4.5, seed: 1008 },
+    { slope: 5.0, stimp: 6.0, trueRoll: 2.0, distance: 5.0, seed: 1009 },
+];
+
 // ===================================================================
 // TRAIL SYSTEM (efficient pre-allocated buffers)
 // ===================================================================
@@ -1258,23 +1279,12 @@ window.addEventListener('keydown', (e) => {
     }
 
     // Discrete key events
-    if (e.key === ' ' && !ballMoving && !inHole) shoot();
-    if (e.key === 'x' || e.key === 'X') stimpM = Math.min(6.0, stimpM + 0.1);
-    if (e.key === 'y' || e.key === 'Y') stimpM = Math.max(1.0, stimpM - 0.1);
+    // During game mode: allow shoot (space), camera (B, Z/U), help (H) only
+    if (e.key === ' ' && !ballMoving && !inHole) {
+        if (!gameState || gameState === 'putting') shoot();
+    }
     if (e.key === 'h' || e.key === 'H') showHelp = !showHelp;
-    if (e.key === 'f' || e.key === 'F') cycleFlowMode();
     if (e.key === 'b' || e.key === 'B') resetCamera();
-    if ((e.key === 'r' || e.key === 'R') && !e.repeat) resetBall(e.shiftKey);
-    if (e.key === '1' && !ballMoving && ballOnCircle) {
-        ballCircleRadius = Math.max(BALL_CIRCLE_MIN, ballCircleRadius - BALL_CIRCLE_STEP);
-        updateBallOnCircle();
-    }
-    if (e.key === '2' && !ballMoving && ballOnCircle) {
-        ballCircleRadius = Math.min(BALL_CIRCLE_MAX, ballCircleRadius + BALL_CIRCLE_STEP);
-        updateBallOnCircle();
-    }
-    if (e.key === '3') launchAngleDeg = Math.max(LAUNCH_ANGLE_MIN, launchAngleDeg - LAUNCH_ANGLE_STEP);
-    if (e.key === '4') launchAngleDeg = Math.min(LAUNCH_ANGLE_MAX, launchAngleDeg + LAUNCH_ANGLE_STEP);
     if (e.key === 'z' || e.key === 'Z') {
         camera.fov = Math.max(ZOOM_MIN, camera.fov - ZOOM_STEP);
         camera.updateProjectionMatrix();
@@ -1282,6 +1292,24 @@ window.addEventListener('keydown', (e) => {
     if (e.key === 'u' || e.key === 'U') {
         camera.fov = Math.min(ZOOM_MAX, camera.fov + ZOOM_STEP);
         camera.updateProjectionMatrix();
+    }
+    // Allowed during game mode
+    if (e.key === 'f' || e.key === 'F') cycleFlowMode();
+    // Blocked during game mode
+    if (!gameState) {
+        if (e.key === 'x' || e.key === 'X') stimpM = Math.min(6.0, stimpM + 0.1);
+        if (e.key === 'y' || e.key === 'Y') stimpM = Math.max(1.0, stimpM - 0.1);
+        if ((e.key === 'r' || e.key === 'R') && !e.repeat) resetBall(e.shiftKey);
+        if (e.key === '1' && !ballMoving && ballOnCircle) {
+            ballCircleRadius = Math.max(BALL_CIRCLE_MIN, ballCircleRadius - BALL_CIRCLE_STEP);
+            updateBallOnCircle();
+        }
+        if (e.key === '2' && !ballMoving && ballOnCircle) {
+            ballCircleRadius = Math.min(BALL_CIRCLE_MAX, ballCircleRadius + BALL_CIRCLE_STEP);
+            updateBallOnCircle();
+        }
+        if (e.key === '3') launchAngleDeg = Math.max(LAUNCH_ANGLE_MIN, launchAngleDeg - LAUNCH_ANGLE_STEP);
+        if (e.key === '4') launchAngleDeg = Math.min(LAUNCH_ANGLE_MAX, launchAngleDeg + LAUNCH_ANGLE_STEP);
     }
 });
 
@@ -1363,24 +1391,29 @@ const valDist   = document.getElementById('val-dist');
 const valLaunch = document.getElementById('val-launch');
 
 slAngle.addEventListener('input', () => {
+    if (gameState) { syncSlidersFromState(); return; }
     angleDeg = parseFloat(slAngle.value);
     valAngle.textContent = angleDeg.toFixed(1);
 });
 slStimp.addEventListener('input', () => {
+    if (gameState) { syncSlidersFromState(); return; }
     stimpM = parseFloat(slStimp.value);
     valStimp.textContent = stimpM.toFixed(1);
 });
 slTroll.addEventListener('input', () => {
+    if (gameState) { syncSlidersFromState(); return; }
     setTrueRollStrength(parseFloat(slTroll.value));
     valTroll.textContent = getTrueRollStrength().toFixed(1);
 });
 slDist.addEventListener('input', () => {
+    if (gameState) { syncSlidersFromState(); return; }
     if (ballMoving || !ballOnCircle) return;
     ballCircleRadius = parseFloat(slDist.value);
     valDist.textContent = ballCircleRadius.toFixed(1);
     updateBallOnCircle();
 });
 slLaunch.addEventListener('input', () => {
+    if (gameState) { syncSlidersFromState(); return; }
     launchAngleDeg = parseInt(slLaunch.value, 10);
     valLaunch.textContent = launchAngleDeg;
 });
@@ -1402,17 +1435,20 @@ function syncSlidersFromState() {
 // ---- Action buttons ----
 document.getElementById('shoot-btn').addEventListener('click', (e) => {
     e.preventDefault();
-    if (!ballMoving && !inHole) shoot();
+    if (!ballMoving && !inHole && (!gameState || gameState === 'putting')) shoot();
 });
 
 document.getElementById('action-btns').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
-    switch (btn.dataset.action) {
+    const action = btn.dataset.action;
+    if (gameState && action !== 'startGame' && action !== 'resetCam' && action !== 'cycleFlow') return;
+    switch (action) {
         case 'reset':      resetBall(false); break;
         case 'newTerrain':  resetBall(true); break;
         case 'cycleFlow':   cycleFlowMode(); break;
         case 'resetCam':    resetCamera(); break;
+        case 'startGame':   startGame(); break;
     }
 });
 
@@ -1456,6 +1492,193 @@ renderer.domElement.addEventListener('touchend', (e) => {
 }, { passive: true });
 
 // ===================================================================
+// GAME MODE
+// ===================================================================
+const gameHudEl = document.getElementById('game-hud');
+const gameHoleEl = document.getElementById('game-hole');
+const scorecardEl = document.getElementById('scorecard');
+const scorePopupEl = document.getElementById('score-popup');
+const gameOverEl = document.getElementById('game-over');
+const gameFinalScoreEl = document.getElementById('game-final-score');
+const gameGradeEl = document.getElementById('game-grade');
+const gameExitLiveEl = document.getElementById('game-exit-live');
+
+function updateScorecard() {
+    let html = '';
+    for (let i = 0; i < 9; i++) {
+        const isCurrent = i === gameHoleIndex && gameState !== 'gameover';
+        const isFuture = i > gameHoleIndex || (i === gameHoleIndex && (gameState === 'putting' || gameState === 'moving' || gameState === 'setup'));
+        const cls = isCurrent ? ' current' : (isFuture ? ' future' : '');
+        const pts = i < gameHoleScores.length ? gameHoleScores[i] : '-';
+        html += `<div class="sc-hole${cls}"><span class="sc-num">${i + 1}</span><span class="sc-pts">${pts}</span></div>`;
+    }
+    html += `<div class="sc-total"><span class="sc-num">TOT</span><span class="sc-pts">${gameScore}</span></div>`;
+    scorecardEl.innerHTML = html;
+}
+
+function startGame() {
+    gameState = 'setup';
+    gameHoleIndex = 0;
+    gameScore = 0;
+    gameHoleScores = [];
+    // Hide free-play UI (keep stats visible)
+    helpEl.style.display = 'none';
+    sliderPanel.classList.add('collapsed');
+    sliderPanel.style.display = 'none';
+    document.getElementById('action-btns').style.display = 'none';
+    gameOverEl.classList.remove('show');
+    // Show game HUD + exit button
+    gameHudEl.style.display = '';
+    gameExitLiveEl.style.display = 'block';
+    updateScorecard();
+    setupHole(0);
+}
+
+function setupHole(index) {
+    const hole = GAME_HOLES[index];
+    // Set parameters
+    angleDeg = hole.slope;
+    stimpM = hole.stimp;
+    setTrueRollStrength(hole.trueRoll);
+    ballCircleRadius = hole.distance;
+    launchAngleDeg = 0; // pure roll in game mode
+
+    // Rebuild terrain with specific seed
+    clearAllTrails();
+    shotAimPoints = [];
+    clearAimPointMarkers();
+    buildTrueRollGrids(hole.seed);
+    worldGroup.remove(greenMesh);
+    greenMesh.geometry.dispose();
+    greenMesh = buildGreenMesh();
+    worldGroup.add(greenMesh);
+    rebuildSlopeIndicator();
+
+    // Random ball angle
+    ballAngle = Math.random() * Math.PI * 2;
+    lastCircleAngle = ballAngle;
+    updateBallOnCircle();
+    ballMoving = false;
+    ballOnCircle = true;
+    ballAirborne = false;
+    inHole = false;
+
+    // Save start position for later
+    gameStartPos = { x: ballPos[0], z: ballPos[2] };
+
+    // Hide all visual aids
+    flowMode = 0;
+    flowGroup.visible = false;
+    gridFlowGroup.visible = false;
+    gradientGroup.visible = false;
+    goodAimGroup.visible = false;
+
+    // Reset camera
+    resetCamera();
+
+    gameCrossedHole = false;
+    gameState = 'putting';
+
+    // Update game HUD
+    gameHoleEl.textContent = `Hole ${index + 1}/9`;
+    updateScorecard();
+}
+
+function scoreShot(oob) {
+    const distToHole = Math.hypot(ballPos[0], ballPos[2]);
+    const ballDiam = 2 * BALL_RADIUS_M;
+    let pts = 0;
+    let label = '';
+
+    if (oob) {
+        pts = 0;
+        label = 'Out of bounds! +0';
+    } else if (inHole) {
+        pts = 10;
+        label = 'IN THE HOLE! +10';
+    } else if (gameCrossedHole) {
+        pts = 5;
+        label = 'Lip out! +5';
+    } else if (distToHole <= ballDiam) {
+        pts = 3;
+        label = 'Close! +3';
+    } else if (distToHole <= ballDiam * 3) {
+        pts = 1;
+        label = 'Near +1';
+    } else {
+        pts = 0;
+        label = 'Miss +0';
+    }
+
+    gameScore += pts;
+    gameHoleScores.push(pts);
+    updateScorecard();
+
+    // Show score popup
+    scorePopupEl.textContent = label;
+    scorePopupEl.classList.remove('show');
+    void scorePopupEl.offsetWidth; // force reflow to restart animation
+    scorePopupEl.classList.add('show');
+
+    gameState = 'reveal';
+
+    // Auto-advance after 3 seconds
+    setTimeout(() => {
+        if (gameState !== 'reveal') return; // guard against double-fire
+        scorePopupEl.classList.remove('show');
+        if (gameHoleIndex < 8) {
+            gameHoleIndex++;
+            setupHole(gameHoleIndex);
+        } else {
+            endGame();
+        }
+    }, 3000);
+}
+
+function endGame() {
+    gameState = 'gameover';
+    gameHudEl.style.display = 'none';
+    gameExitLiveEl.style.display = 'none';
+
+    let grade;
+    if (gameScore >= 81) grade = 'GOAT';
+    else if (gameScore >= 61) grade = 'Tour Pro';
+    else if (gameScore >= 41) grade = 'Scratch Golfer';
+    else if (gameScore >= 21) grade = 'Club Player';
+    else grade = 'Amateur';
+
+    gameFinalScoreEl.textContent = `${gameScore} / 90`;
+    gameGradeEl.textContent = grade;
+    gameOverEl.classList.add('show');
+}
+
+function exitGame() {
+    gameState = null;
+    gameOverEl.classList.remove('show');
+    gameHudEl.style.display = 'none';
+    gameExitLiveEl.style.display = 'none';
+    scorePopupEl.classList.remove('show');
+    // Restore free-play UI
+    statsEl.style.display = '';
+    helpEl.style.display = '';
+    sliderPanel.style.display = '';
+    document.getElementById('action-btns').style.display = '';
+    // Reset to defaults
+    angleDeg = 0;
+    stimpM = STIMP_DEFAULT;
+    setTrueRollStrength(1.0);
+    ballCircleRadius = BALL_CIRCLE_RADIUS_DEFAULT;
+    launchAngleDeg = LAUNCH_ANGLE_DEFAULT;
+    resetBall(true);
+    resetCamera();
+}
+
+// Wire game buttons
+document.getElementById('game-play-again').addEventListener('click', () => startGame());
+document.getElementById('game-exit-btn').addEventListener('click', () => exitGame());
+gameExitLiveEl.addEventListener('click', () => exitGame());
+
+// ===================================================================
 // ACTIONS
 // ===================================================================
 function shoot() {
@@ -1483,6 +1706,12 @@ function shoot() {
     maxHeight = ballPos[1];
     ballSpin = launchAngleDeg / 15.0;
     travelDist = 0.0;
+
+    // Game mode: transition to 'moving'
+    if (gameState === 'putting') {
+        gameState = 'moving';
+        gameCrossedHole = false;
+    }
 
     // Ensure first trail point
     if (!currentTrailLine || currentTrailLine.count === 0) {
@@ -1678,12 +1907,25 @@ function updatePhysics(dt) {
     ballPos[1] = newY;
     ballPos[2] = newZ;
 
-    // Hole capture check
+    // Game mode: out of bounds check (6m from hole)
     const distToHole = Math.hypot(ballPos[0], ballPos[2]);
+    if (gameState === 'moving' && distToHole > GAME_OOB_DIST) {
+        ballMoving = false;
+        ballVel = [0, 0, 0];
+        scoreShot(true);
+        return;
+    }
+
+    // Hole capture check
     const holeBottom = -holeDepth + BALL_RADIUS_M;
     const speedXz = Math.hypot(ballVel[0], ballVel[2]);
     const crossedHole = closestDist <= HOLE_RADIUS_M && !ballAirborne;
     const ballDroppedIn = (distToHole <= HOLE_RADIUS_M + BALL_RADIUS_M) && ballPos[1] < BALL_RADIUS_M * 0.5;
+
+    // Track ball crossing hole for game lip-out detection
+    if (gameState === 'moving' && (crossedHole || distToHole <= HOLE_RADIUS_M)) {
+        gameCrossedHole = true;
+    }
 
     if (ballDroppedIn || distToHole <= HOLE_RADIUS_M || crossedHole) {
         if (ballDroppedIn || (!ballAirborne && speedXz < 1.45)) {
@@ -1708,6 +1950,9 @@ function updatePhysics(dt) {
             // Only turn aim point blue if ghost rest is within the collar (30cm)
             const ghostDist = Math.hypot(rest.x, rest.z);
             colorLastAimPoint(ghostDist <= MAX_GHOST_DIST);
+
+            // Game mode scoring on hole-in
+            if (gameState === 'moving') scoreShot(false);
         } else if (distToHole <= HOLE_RADIUS_M) {
             // Lip-out
             ballVel[0] *= 0.92;
@@ -1717,6 +1962,8 @@ function updatePhysics(dt) {
         ballMoving = false;
         ballVel = [0, 0, 0];
         colorLastAimPoint(false);
+        // Game mode scoring on miss/near
+        if (gameState === 'moving') scoreShot(false);
     } else {
         addTrailPoint(ballPos[0], ballPos[1], ballPos[2]);
     }
@@ -1793,10 +2040,12 @@ function animate() {
     dt = Math.min(dt, 1 / 30); // Clamp to avoid huge steps after tab switch
 
     // ---- Held keys ----
-    if (keysHeld['ArrowUp'])   angleDeg = Math.min(ANGLE_MAX_DEG, angleDeg + ANGLE_STEP_DEG);
-    if (keysHeld['ArrowDown']) angleDeg = Math.max(-ANGLE_MAX_DEG, angleDeg - ANGLE_STEP_DEG);
-    if (keysHeld['q'] || keysHeld['Q']) setTrueRollStrength(Math.max(0, getTrueRollStrength() - 0.1));
-    if (keysHeld['w'] || keysHeld['W']) setTrueRollStrength(Math.min(20, getTrueRollStrength() + 0.1));
+    if (!gameState) {
+        if (keysHeld['ArrowUp'])   angleDeg = Math.min(ANGLE_MAX_DEG, angleDeg + ANGLE_STEP_DEG);
+        if (keysHeld['ArrowDown']) angleDeg = Math.max(-ANGLE_MAX_DEG, angleDeg - ANGLE_STEP_DEG);
+        if (keysHeld['q'] || keysHeld['Q']) setTrueRollStrength(Math.max(0, getTrueRollStrength() - 0.1));
+        if (keysHeld['w'] || keysHeld['W']) setTrueRollStrength(Math.min(20, getTrueRollStrength() + 0.1));
+    }
 
     if (!ballMoving && ballOnCircle) {
         if (keysHeld['ArrowLeft']) {
