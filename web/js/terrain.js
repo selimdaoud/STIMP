@@ -6,7 +6,7 @@ export const TR_WORLD_SIZE = 12.0;
 export const TR_BASE_AMP = 0.5;
 export const TR_TARGET_AMP = 0.1;
 export const TR_SMOOTH_PASSES = 8;
-export const HEIGHT_SCALE = 0.02;
+export const HEIGHT_SCALE = 0.01;
 
 // Seeded PRNG (mulberry32) so terrain is reproducible when seed is given
 function mulberry32(seed) {

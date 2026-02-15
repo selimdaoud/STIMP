@@ -42,6 +42,33 @@
   }
   #shoot-btn:active { background: rgba(220, 30, 30, 1.0); transform: scale(0.93); }
 
+  /* ---- Hint button (game mode) ---- */
+  #hint-btn {
+    position: absolute; bottom: 38px; right: 135px;
+    width: 70px; height: 70px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.4);
+    background: rgba(120, 125, 135, 0.85); color: #fff;
+    font-family: 'Courier New', monospace; font-size: 13px; font-weight: bold;
+    cursor: pointer; pointer-events: auto; z-index: 20;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent; user-select: none;
+    display: none;
+  }
+  #hint-btn:active { background: rgba(120, 125, 135, 1.0); transform: scale(0.93); }
+  #hint-btn.used { opacity: 0.35; pointer-events: none; }
+
+  /* ---- Flow button (game mode) ---- */
+  #flow-btn {
+    position: absolute; bottom: 64px; left: 20px;
+    padding: 10px 16px;
+    border: 1px solid rgba(255,255,255,0.3); border-radius: 6px;
+    background: rgba(20, 23, 28, 0.8); color: #ebebeb;
+    font-family: 'Courier New', monospace; font-size: 13px;
+    cursor: pointer; pointer-events: auto; z-index: 20;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent; user-select: none;
+    white-space: nowrap; display: none;
+  }
+  #flow-btn:active { background: rgba(60, 65, 75, 0.9); }
+
   /* ---- Action buttons ---- */
   #action-btns {
     position: absolute; bottom: 20px; left: 20px;
@@ -173,6 +200,20 @@
     display: none;
   }
   #game-exit-live:active { background: rgba(90, 95, 105, 0.9); }
+
+  /* ---- Light debug section (inside slider panel) ---- */
+  #ld-section { display: none; }
+  #ld-divider {
+    height: 1px; background: rgba(255,255,255,0.2); margin: 4px 0;
+  }
+  .ld-title {
+    font-family: 'Courier New', monospace; font-size: 11px;
+    color: #ffe033; font-weight: bold; margin-bottom: 2px;
+  }
+  .ld-label {
+    font-family: 'Courier New', monospace; font-size: 11px; color: #ebebeb;
+  }
+  .ld-label .ld-val { color: #ffe033; }
 </style>
 </head>
 <body>
@@ -198,6 +239,8 @@
   </div>
 </div>
 
+<button id="flow-btn">Flow</button>
+<button id="hint-btn">HINT</button>
 <button id="shoot-btn">SHOOT</button>
 
 <div id="action-btns">
@@ -237,19 +280,52 @@
     </label>
     <label>
       <span class="slider-label">True Roll <span id="val-troll">1.0</span></span>
-      <input type="range" id="sl-troll" min="0" max="20" step="0.1" value="1.0">
+      <input type="range" id="sl-troll" min="0" max="4" step="0.1" value="1.0">
     </label>
     <label>
       <span class="slider-label">Distance <span id="val-dist">3.0</span>m</span>
-      <input type="range" id="sl-dist" min="1.0" max="5.5" step="0.5" value="3.0">
+      <input type="range" id="sl-dist" min="1.0" max="5.5" step="0.25" value="3.0">
+    </label>
+    <label>
+      <span class="slider-label">Position <span id="val-pos">0</span>&deg;</span>
+      <input type="range" id="sl-pos" min="0" max="360" step="1" value="0">
     </label>
     <label>
       <span class="slider-label">Launch <span id="val-launch">5</span>&deg;</span>
       <input type="range" id="sl-launch" min="-4" max="15" step="1" value="5">
     </label>
+    <div id="ld-section">
+      <div id="ld-divider"></div>
+      <span class="ld-title">Lighting</span>
+      <label>
+        <span class="ld-label">Diffuse <span class="ld-val" id="ld-v-diffuse">1.00</span></span>
+        <input type="range" id="ld-diffuse" min="0" max="2" step="0.05" value="1">
+      </label>
+      <label>
+        <span class="ld-label">Ambient <span class="ld-val" id="ld-v-ambient">0.45</span></span>
+        <input type="range" id="ld-ambient" min="0" max="1" step="0.05" value="0.45">
+      </label>
+      <label>
+        <span class="ld-label">Specular <span class="ld-val" id="ld-v-specular">1.00</span></span>
+        <input type="range" id="ld-specular" min="0" max="2" step="0.05" value="1">
+      </label>
+      <label>
+        <span class="ld-label">Fresnel <span class="ld-val" id="ld-v-fresnel">1.00</span></span>
+        <input type="range" id="ld-fresnel" min="0" max="2" step="0.05" value="1">
+      </label>
+      <label>
+        <span class="ld-label">Slope <span class="ld-val" id="ld-v-slope">20</span></span>
+        <input type="range" id="ld-slope" min="0" max="80" step="1" value="20">
+      </label>
+      <label>
+        <span class="ld-label">DirLight <span class="ld-val" id="ld-v-dirlight">0.80</span></span>
+        <input type="range" id="ld-dirlight" min="0" max="2" step="0.05" value="0.8">
+      </label>
+    </div>
   </div>
 </div>
 
+<script>window.SHOW_LIGHT_DEBUG = true;</script>
 <script type="importmap">
 {
   "imports": {

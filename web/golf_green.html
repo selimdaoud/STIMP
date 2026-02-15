@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Golf Green - WebGL</title>
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+            background: #000;
+            font-family: Arial, sans-serif;
+        }
+        canvas {
+            position: fixed;
+            inset: 0;
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 15px;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        #info p {
+            margin: 5px 0;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="info">
+        <p>🖱️ Bouger la souris pour changer l'angle de vue</p>
+        <p>📱 Observer les reflets du gazon</p>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const gl = canvas.getContext('webgl2');
+
+        if (!gl) {
+            alert('WebGL2 non supporté');
+            throw new Error('WebGL2 non supporté');
+        }
+
+        function resizeCanvas() {
+            const dpr = Math.min(window.devicePixelRatio || 1, 2);
+            const displayWidth = Math.floor(window.innerWidth);
+            const displayHeight = Math.floor(window.innerHeight);
+
+            canvas.width = Math.floor(displayWidth * dpr);
+            canvas.height = Math.floor(displayHeight * dpr);
+            gl.viewport(0, 0, canvas.width, canvas.height);
+        }
+
+        resizeCanvas();
+
+        // Vertex Shader
+        const vertexShaderSource = `#version 300 es
+            precision highp float;
+
+            in vec3 aPosition;
+            in vec3 aNormal;
+
+            uniform mat4 uProjection;
+            uniform mat4 uView;
+            uniform mat4 uModel;
+
+            out vec3 vPosition;
+            out vec3 vNormal;
+
+            void main() {
+                vPosition = vec3(uModel * vec4(aPosition, 1.0));
+                vNormal = normalize(mat3(uModel) * aNormal);
+                gl_Position = uProjection * uView * vec4(vPosition, 1.0);
+            }
+        `;
+
+        // Sky background depuis une HDR equirectangulaire
+        const skyVertexShaderSource = `#version 300 es
+            precision highp float;
+            out vec2 vUv;
+            void main() {
+                vec2 pos;
+                if (gl_VertexID == 0) pos = vec2(-1.0, -1.0);
+                else if (gl_VertexID == 1) pos = vec2(3.0, -1.0);
+                else pos = vec2(-1.0, 3.0);
+                vUv = pos * 0.5 + 0.5;
+                gl_Position = vec4(pos, 0.0, 1.0);
+            }
+        `;
+
+        const skyFragmentShaderSource = `#version 300 es
+            precision highp float;
+            in vec2 vUv;
+            uniform sampler2D uSkyHdr;
+            uniform vec3 uCameraRight;
+            uniform vec3 uCameraUp;
+            uniform vec3 uCameraForward;
+            uniform float uAspect;
+            uniform float uTanHalfFov;
+            uniform float uExposure;
+            uniform int uHdrReady;
+            out vec4 FragColor;
+
+            const float PI = 3.14159265359;
+            const float TAU = 6.28318530718;
+
+            vec2 dirToEquirect(vec3 dir) {
+                float u = atan(dir.x, dir.z) / TAU + 0.5;
+                float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
+                return vec2(u, v);
+            }
+
+            void main() {
+                vec2 ndc = vUv * 2.0 - 1.0;
+                vec3 rayDir = normalize(
+                    uCameraForward +
+                    uCameraRight * (ndc.x * uAspect * uTanHalfFov) +
+                    uCameraUp * (ndc.y * uTanHalfFov)
+                );
+
+                if (uHdrReady == 1) {
+                    vec2 uv = dirToEquirect(rayDir);
+                    vec3 hdr = texture(uSkyHdr, uv).rgb;
+                    vec3 mapped = vec3(1.0) - exp(-hdr * uExposure);
+                    mapped = pow(mapped, vec3(1.0 / 2.2));
+                    FragColor = vec4(mapped, 1.0);
+                } else {
+                    float h = clamp(rayDir.y * 0.5 + 0.5, 0.0, 1.0);
+                    vec3 fallbackCol = mix(vec3(0.05, 0.07, 0.1), vec3(0.25, 0.35, 0.5), h);
+                    FragColor = vec4(fallbackCol, 1.0);
+                }
+            }
+        `;
+
+        // Fragment Shader avec texture de gazon et reflets
+        const fragmentShaderSource = `#version 300 es
+            precision highp float;
+
+            in vec3 vPosition;
+            in vec3 vNormal;
+
+            uniform vec3 uLightPos;
+            uniform vec3 uViewPos;
+            uniform sampler2D uGrassTexture;
+            uniform vec4 uShapeSeedA;
+            uniform vec4 uShapeSeedB;
+
+            out vec4 FragColor;
+
+            // Fonction de bruit pour texture naturelle
+            float random(vec2 st) {
+                return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+            }
+
+            float noise(vec2 st) {
+                vec2 i = floor(st);
+                vec2 f = fract(st);
+                f = f * f * (3.0 - 2.0 * f);
+
+                float a = random(i);
+                float b = random(i + vec2(1.0, 0.0));
+                float c = random(i + vec2(0.0, 1.0));
+                float d = random(i + vec2(1.0, 1.0));
+
+                return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+            }
+
+            // Calcul de la heightmap procédurale pour le relief
+            float heightMap(vec2 uv) {
+                // Relief basse fréquence pour ondulation douce
+                float h = noise(uv * 3.0) * 0.3;
+                h += noise(uv * 6.0) * 0.2;
+                
+                // Petit relief fin pour les brins
+                h += noise(uv * 50.0) * 0.1;
+                h += noise(uv * 100.0) * 0.05;
+                
+                return h;
+            }
+
+            // Générer une normal map à partir de la heightmap
+            vec3 getNormal(vec2 uv) {
+                float epsilon = 0.001;
+                
+                float h0 = heightMap(uv);
+                float hx = heightMap(uv + vec2(epsilon, 0.0));
+                float hy = heightMap(uv + vec2(0.0, epsilon));
+                
+                vec3 normal = normalize(vec3(
+                    (h0 - hx) * 50.0,
+                    epsilon,
+                    (h0 - hy) * 50.0
+                ));
+                
+                return normal;
+            }
+
+            vec3 grassColor(vec2 uv) {
+                // Couleurs extraites des photos réelles du green
+                // Variation de verts plus clairs et moins saturés
+                vec3 grassDark = vec3(0.35, 0.38, 0.18);      // Vert foncé
+                vec3 grassMid = vec3(0.45, 0.50, 0.22);       // Vert moyen
+                vec3 grassLight = vec3(0.50, 0.55, 0.26);     // Vert clair
+                vec3 grassVeryLight = vec3(0.55, 0.60, 0.28); // Vert très clair
+                
+                // Bruit basse fréquence pour zones cohérentes (2-4 Hz)
+                float zoneNoise = noise(uv * 2.5) * 0.5 + noise(uv * 4.0) * 0.5;
+                
+                // Bruit moyen pour variation entre zones (8-12 Hz)
+                float midNoise = noise(uv * 8.0) * 0.6 + noise(uv * 12.0) * 0.4;
+                
+                // Combiner pour zones cohérentes mais variées
+                float mainZone = zoneNoise * 0.7 + midNoise * 0.3;
+                
+                // Détail fin SEULEMENT pour les brins (très subtil)
+                float finDetail = noise(uv * 80.0) * 0.2 + noise(uv * 120.0) * 0.15;
+                
+                // Détail ultra fin pour micro-brins
+                float microDetail = noise(uv * 300.0) * 0.08;
+                
+                // Palette cohérente basée sur les grandes zones
+                // Moins de transition, plus de cohérence
+                vec3 color;
+                if(mainZone < 0.35) {
+                    color = grassDark;
+                } else if(mainZone < 0.55) {
+                    color = mix(grassDark, grassMid, (mainZone - 0.35) / 0.2);
+                } else if(mainZone < 0.75) {
+                    color = mix(grassMid, grassLight, (mainZone - 0.55) / 0.2);
+                } else {
+                    color = mix(grassLight, grassVeryLight, (mainZone - 0.75) / 0.25);
+                }
+                
+                // Ajouter détail fin minimal sur la couleur de base
+                color += (finDetail + microDetail) * 0.015;
+                
+                // Variation subtile dans les zones (limité à 3%)
+                float zoneVar = noise(uv * 15.0) * 0.03;
+                color *= (1.0 + zoneVar);
+                
+                return color;
+            }
+
+            // Forme organique du green (combinaison d'ellipses + irrégularité)
+            float sdEllipse(vec2 p, vec2 r) {
+                vec2 q = p / r;
+                return length(q) - 1.0;
+            }
+
+            mat2 rot2(float a) {
+                float s = sin(a);
+                float c = cos(a);
+                return mat2(c, -s, s, c);
+            }
+
+            float greenSignedDistance(vec2 p) {
+                float a0 = mix(-0.18, 0.22, uShapeSeedA.x);
+                float a1 = mix(-0.45, -0.05, uShapeSeedA.y);
+                float a2 = mix(0.08, 0.55, uShapeSeedA.z);
+
+                vec2 o1 = vec2(
+                    mix(2.8, 6.2, uShapeSeedA.w),
+                    mix(-3.2, -0.6, uShapeSeedB.x)
+                );
+                vec2 o2 = vec2(
+                    mix(-6.0, -2.6, uShapeSeedB.y),
+                    mix(0.8, 3.8, uShapeSeedB.z)
+                );
+
+                vec2 p0 = rot2(a0) * p;
+                vec2 p1 = rot2(a1) * (p - o1);
+                vec2 p2 = rot2(a2) * (p - o2);
+
+                vec2 rMain = vec2(
+                    mix(10.5, 15.5, uShapeSeedB.w),
+                    mix(8.2, 11.8, uShapeSeedA.x)
+                );
+                vec2 rL1 = vec2(
+                    mix(4.2, 7.0, uShapeSeedA.y),
+                    mix(3.4, 5.6, uShapeSeedA.z)
+                );
+                vec2 rL2 = vec2(
+                    mix(4.0, 6.8, uShapeSeedB.x),
+                    mix(3.0, 5.0, uShapeSeedB.y)
+                );
+
+                float dMain = sdEllipse(p0, rMain);
+                float dLobe1 = sdEllipse(p1, rL1);
+                float dLobe2 = sdEllipse(p2, rL2);
+
+                float d = min(dMain, min(dLobe1, dLobe2));
+
+                // Bord irrégulier subtil pour casser la géométrie parfaite
+                float edgeF1 = mix(0.16, 0.32, uShapeSeedA.w);
+                float edgeF2 = mix(0.36, 0.62, uShapeSeedB.z);
+                float edgeAmp = mix(0.22, 0.62, uShapeSeedB.w);
+                float edgeNoise = noise(p * edgeF1 + uShapeSeedA.xy * 3.0) * 0.6
+                    + noise(p * edgeF2 + uShapeSeedB.xy * 5.0) * 0.35;
+                d += (edgeNoise - 0.45) * edgeAmp;
+                return d;
+            }
+
+            void main() {
+                vec2 uv = vPosition.xz * 0.5;
+                vec2 ground = vPosition.xz;
+                float greenSd = greenSignedDistance(ground);
+
+                // Hors green: ne pas dessiner (on voit le HDRI derrière)
+                if (greenSd > 0.0) {
+                    discard;
+                }
+
+                vec3 grassCol = grassColor(uv);
+                
+                // Obtenir la normale perturbée pour le relief
+                vec3 perturbedNormal = getNormal(uv);
+                
+                // Mélanger avec la normale de surface pour effet subtil
+                vec3 finalNormal = normalize(mix(vNormal, perturbedNormal, 0.5));
+                
+                // Direction lumineuse
+                vec3 lightDir = normalize(uLightPos - vPosition);
+                vec3 viewDir = normalize(uViewPos - vPosition);
+                vec3 halfDir = normalize(lightDir + viewDir);
+                
+                // Diffuse avec normale perturbée
+                float diff = max(dot(finalNormal, lightDir), 0.0);
+                vec3 diffuse = diff * grassCol * vec3(1.0, 1.0, 0.98);
+                
+                // Ambient plus important (gazon moins brillant)
+                vec3 ambient = grassCol * 0.45;
+                
+                // Specular renforcé avec variation locale (humidité/rosée)
+                float wetness = 0.55 + noise(uv * 10.0) * 0.35;
+                float shininess = mix(18.0, 42.0, wetness);
+                float spec = pow(max(dot(finalNormal, halfDir), 0.0), shininess);
+                vec3 specular = spec * vec3(0.82, 0.85, 0.72) * (0.32 * wetness);
+                
+                // Fresnel plus lisible au rasant
+                float fresnel = pow(1.0 - max(dot(viewDir, finalNormal), 0.0), 3.0);
+                vec3 frenelSpecular = fresnel * vec3(0.68, 0.74, 0.60) * (0.22 * wetness);
+                
+                // Ombre d'auto-occlusion très subtile
+                float heightShadow = heightMap(uv);
+                heightShadow = mix(0.95, 1.0, heightShadow);
+
+                // Collar légèrement plus sombre vers le bord
+                float edgeBand = smoothstep(-1.8, -0.25, greenSd);
+                vec3 collarTint = mix(vec3(0.86, 0.90, 0.82), vec3(1.0), edgeBand);
+
+                vec3 finalColor = (ambient + diffuse + specular + frenelSpecular) * heightShadow * collarTint;
+                
+                // Brume légère pour profondeur
+                float fog = 1.0 - length(vPosition) * 0.01;
+                finalColor = mix(vec3(0.0, 0.0, 0.0), finalColor, clamp(fog, 0.0, 1.0));
+                
+                FragColor = vec4(finalColor, 1.0);
+            }
+        `;
+
+        function compileShader(source, type) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error('Shader compilation error:', gl.getShaderInfoLog(shader));
+            }
+            return shader;
+        }
+
+        function parseHdr(buffer) {
+            const bytes = new Uint8Array(buffer);
+            let pos = 0;
+
+            function readLine() {
+                const start = pos;
+                while (pos < bytes.length && bytes[pos] !== 10) pos++;
+                const line = new TextDecoder().decode(bytes.subarray(start, pos)).replace(/\r$/, '');
+                pos++;
+                return line;
+            }
+
+            let line = readLine();
+            if (!line.startsWith('#?RADIANCE') && !line.startsWith('#?RGBE')) {
+                throw new Error('Format HDR invalide');
+            }
+
+            while (pos < bytes.length) {
+                line = readLine();
+                if (line === '') break;
+            }
+
+            const resolution = readLine();
+            const match = resolution.match(/-Y\s+(\d+)\s+\+X\s+(\d+)/);
+            if (!match) throw new Error('Resolution HDR non supportee');
+            const height = Number(match[1]);
+            const width = Number(match[2]);
+
+            const data = new Float32Array(width * height * 3);
+            let offset = 0;
+            const scanline = new Uint8Array(width * 4);
+
+            for (let y = 0; y < height; y++) {
+                if (bytes[pos++] !== 2 || bytes[pos++] !== 2) {
+                    throw new Error('Scanline HDR non supportee');
+                }
+                const scanlineWidth = (bytes[pos++] << 8) | bytes[pos++];
+                if (scanlineWidth !== width) {
+                    throw new Error('Largeur scanline invalide');
+                }
+
+                for (let channel = 0; channel < 4; channel++) {
+                    let i = 0;
+                    while (i < width) {
+                        const count = bytes[pos++];
+                        if (count > 128) {
+                            const runLength = count - 128;
+                            const value = bytes[pos++];
+                            scanline[channel * width + i] = value;
+                            for (let j = 1; j < runLength; j++) {
+                                scanline[channel * width + i + j] = value;
+                            }
+                            i += runLength;
+                        } else {
+                            const runLength = count;
+                            for (let j = 0; j < runLength; j++) {
+                                scanline[channel * width + i + j] = bytes[pos++];
+                            }
+                            i += runLength;
+                        }
+                    }
+                }
+
+                for (let x = 0; x < width; x++) {
+                    const r = scanline[x];
+                    const g = scanline[width + x];
+                    const b = scanline[2 * width + x];
+                    const e = scanline[3 * width + x];
+                    if (e) {
+                        const scale = Math.pow(2.0, e - 136.0);
+                        data[offset++] = r * scale;
+                        data[offset++] = g * scale;
+                        data[offset++] = b * scale;
+                    } else {
+                        data[offset++] = 0;
+                        data[offset++] = 0;
+                        data[offset++] = 0;
+                    }
+                }
+            }
+
+            return { width, height, data };
+        }
+
+        async function loadHdrTexture(url) {
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`Impossible de charger ${url}`);
+            }
+            const arrayBuffer = await response.arrayBuffer();
+            const hdr = parseHdr(arrayBuffer);
+
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB16F, hdr.width, hdr.height, 0, gl.RGB, gl.FLOAT, hdr.data);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            const linearFloatExt = gl.getExtension('OES_texture_float_linear');
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, linearFloatExt ? gl.LINEAR : gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, linearFloatExt ? gl.LINEAR : gl.NEAREST);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+
+            return texture;
+        }
+
+        const skyProgram = gl.createProgram();
+        gl.attachShader(skyProgram, compileShader(skyVertexShaderSource, gl.VERTEX_SHADER));
+        gl.attachShader(skyProgram, compileShader(skyFragmentShaderSource, gl.FRAGMENT_SHADER));
+        gl.linkProgram(skyProgram);
+
+        if (!gl.getProgramParameter(skyProgram, gl.LINK_STATUS)) {
+            console.error('Sky program link error:', gl.getProgramInfoLog(skyProgram));
+        }
+
+        const program = gl.createProgram();
+        gl.attachShader(program, compileShader(vertexShaderSource, gl.VERTEX_SHADER));
+        gl.attachShader(program, compileShader(fragmentShaderSource, gl.FRAGMENT_SHADER));
+        gl.linkProgram(program);
+
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+            console.error('Program link error:', gl.getProgramInfoLog(program));
+        }
+
+        const skyVao = gl.createVertexArray();
+        const skyHdrLoc = gl.getUniformLocation(skyProgram, 'uSkyHdr');
+        const skyCameraRightLoc = gl.getUniformLocation(skyProgram, 'uCameraRight');
+        const skyCameraUpLoc = gl.getUniformLocation(skyProgram, 'uCameraUp');
+        const skyCameraForwardLoc = gl.getUniformLocation(skyProgram, 'uCameraForward');
+        const skyAspectLoc = gl.getUniformLocation(skyProgram, 'uAspect');
+        const skyTanHalfFovLoc = gl.getUniformLocation(skyProgram, 'uTanHalfFov');
+        const skyExposureLoc = gl.getUniformLocation(skyProgram, 'uExposure');
+        const skyHdrReadyLoc = gl.getUniformLocation(skyProgram, 'uHdrReady');
+        let skyHdrTexture = null;
+
+        gl.useProgram(program);
+
+        // Créer un plan (quad)
+        const positions = new Float32Array([
+            -30, 0, -30,
+             30, 0, -30,
+             30, 0,  30,
+            -30, 0,  30,
+        ]);
+
+        const normals = new Float32Array([
+            0, 1, 0,
+            0, 1, 0,
+            0, 1, 0,
+            0, 1, 0,
+        ]);
+
+        const indices = new Uint16Array([
+            0, 1, 2,
+            0, 2, 3,
+        ]);
+
+        const positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+        const normalBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, normalBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, normals, gl.STATIC_DRAW);
+
+        const indexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+
+        const aPosition = gl.getAttribLocation(program, 'aPosition');
+        const aNormal = gl.getAttribLocation(program, 'aNormal');
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.enableVertexAttribArray(aPosition);
+        gl.vertexAttribPointer(aPosition, 3, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, normalBuffer);
+        gl.enableVertexAttribArray(aNormal);
+        gl.vertexAttribPointer(aNormal, 3, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+
+        // Uniforms
+        const projectionLoc = gl.getUniformLocation(program, 'uProjection');
+        const viewLoc = gl.getUniformLocation(program, 'uView');
+        const modelLoc = gl.getUniformLocation(program, 'uModel');
+        const lightPosLoc = gl.getUniformLocation(program, 'uLightPos');
+        const viewPosLoc = gl.getUniformLocation(program, 'uViewPos');
+        const shapeSeedALoc = gl.getUniformLocation(program, 'uShapeSeedA');
+        const shapeSeedBLoc = gl.getUniformLocation(program, 'uShapeSeedB');
+        const shapeSeedA = new Float32Array([
+            Math.random(),
+            Math.random(),
+            Math.random(),
+            Math.random()
+        ]);
+        const shapeSeedB = new Float32Array([
+            Math.random(),
+            Math.random(),
+            Math.random(),
+            Math.random()
+        ]);
+
+        // Matrices
+        function mat4Identity() {
+            return [
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+                0, 0, 0, 1
+            ];
+        }
+
+        function mat4Multiply(a, b) {
+            const result = new Array(16);
+            for (let i = 0; i < 4; i++) {
+                for (let j = 0; j < 4; j++) {
+                    result[i * 4 + j] = 0;
+                    for (let k = 0; k < 4; k++) {
+                        result[i * 4 + j] += a[i * 4 + k] * b[k * 4 + j];
+                    }
+                }
+            }
+            return result;
+        }
+
+        function mat4Perspective(fov, aspect, near, far) {
+            const f = 1.0 / Math.tan(fov / 2.0);
+            const nf = 1.0 / (near - far);
+            return [
+                f / aspect, 0, 0, 0,
+                0, f, 0, 0,
+                0, 0, (far + near) * nf, -1,
+                0, 0, (2 * far * near) * nf, 0
+            ];
+        }
+
+        function mat4LookAt(eye, center, up) {
+            const z = [eye[0] - center[0], eye[1] - center[1], eye[2] - center[2]];
+            const zLen = Math.sqrt(z[0] * z[0] + z[1] * z[1] + z[2] * z[2]);
+            z[0] /= zLen; z[1] /= zLen; z[2] /= zLen;
+
+            let x = [up[1] * z[2] - up[2] * z[1], up[2] * z[0] - up[0] * z[2], up[0] * z[1] - up[1] * z[0]];
+            const xLen = Math.sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+            x[0] /= xLen; x[1] /= xLen; x[2] /= xLen;
+
+            const y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]];
+
+            return [
+                x[0], y[0], z[0], 0,
+                x[1], y[1], z[1], 0,
+                x[2], y[2], z[2], 0,
+                -(x[0] * eye[0] + x[1] * eye[1] + x[2] * eye[2]),
+                -(y[0] * eye[0] + y[1] * eye[1] + y[2] * eye[2]),
+                -(z[0] * eye[0] + z[1] * eye[1] + z[2] * eye[2]),
+                1
+            ];
+        }
+
+        gl.clearColor(0.0, 0.0, 0.0, 1.0);
+        gl.enable(gl.DEPTH_TEST);
+
+        let mouseX = 0;
+        let mouseY = 0;
+
+        document.addEventListener('mousemove', (e) => {
+            mouseX = (e.clientX / window.innerWidth) * 2 - 1;
+            mouseY = 1 - (e.clientY / window.innerHeight) * 2;
+        });
+
+        // Tactile pour mobile
+        document.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            const touch = e.touches[0];
+            mouseX = (touch.clientX / window.innerWidth) * 2 - 1;
+            mouseY = 1 - (touch.clientY / window.innerHeight) * 2;
+        }, { passive: false });
+
+        function animate() {
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+            const angle = mouseX * Math.PI;
+            const height = 8 + mouseY * 5;
+            const distance = 15;
+            const eye = [
+                Math.sin(angle) * distance,
+                height,
+                Math.cos(angle) * distance
+            ];
+            const center = [0, -2, 0];
+            const forward = [
+                center[0] - eye[0],
+                center[1] - eye[1],
+                center[2] - eye[2]
+            ];
+            const fLen = Math.hypot(forward[0], forward[1], forward[2]) || 1;
+            forward[0] /= fLen; forward[1] /= fLen; forward[2] /= fLen;
+            const worldUp = [0, 1, 0];
+            const right = [
+                forward[1] * worldUp[2] - forward[2] * worldUp[1],
+                forward[2] * worldUp[0] - forward[0] * worldUp[2],
+                forward[0] * worldUp[1] - forward[1] * worldUp[0]
+            ];
+            const rLen = Math.hypot(right[0], right[1], right[2]) || 1;
+            right[0] /= rLen; right[1] /= rLen; right[2] /= rLen;
+            const up = [
+                right[1] * forward[2] - right[2] * forward[1],
+                right[2] * forward[0] - right[0] * forward[2],
+                right[0] * forward[1] - right[1] * forward[0]
+            ];
+
+            // Fond HDRI equirectangulaire
+            gl.disable(gl.DEPTH_TEST);
+            gl.useProgram(skyProgram);
+            gl.bindVertexArray(skyVao);
+            gl.uniform3fv(skyCameraRightLoc, right);
+            gl.uniform3fv(skyCameraUpLoc, up);
+            gl.uniform3fv(skyCameraForwardLoc, forward);
+            gl.uniform1f(skyAspectLoc, canvas.width / canvas.height);
+            gl.uniform1f(skyTanHalfFovLoc, Math.tan(Math.PI / 8));
+            gl.uniform1f(skyExposureLoc, 1.1);
+            gl.uniform1i(skyHdrReadyLoc, skyHdrTexture ? 1 : 0);
+            if (skyHdrTexture) {
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, skyHdrTexture);
+                gl.uniform1i(skyHdrLoc, 0);
+            }
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            gl.bindVertexArray(null);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+            gl.enable(gl.DEPTH_TEST);
+            gl.useProgram(program);
+
+            // Position caméra avec interactivité
+            const projection = mat4Perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 100);
+            const view = mat4LookAt(eye, [0, 0, 0], [0, 1, 0]);
+            const model = mat4Identity();
+
+            gl.uniformMatrix4fv(projectionLoc, false, projection);
+            gl.uniformMatrix4fv(viewLoc, false, view);
+            gl.uniformMatrix4fv(modelLoc, false, model);
+            gl.uniform4fv(shapeSeedALoc, shapeSeedA);
+            gl.uniform4fv(shapeSeedBLoc, shapeSeedB);
+
+            // Position de la lumière (dynamique)
+            const lightAngle = Date.now() * 0.0005;
+            const lightPos = [
+                Math.sin(lightAngle) * 20,
+                15,
+                Math.cos(lightAngle) * 20
+            ];
+
+            gl.uniform3fv(lightPosLoc, lightPos);
+            gl.uniform3fv(viewPosLoc, eye);
+
+            gl.drawElements(gl.TRIANGLES, indices.length, gl.UNSIGNED_SHORT, 0);
+
+            requestAnimationFrame(animate);
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+
+        loadHdrTexture('754.hdr')
+            .then((texture) => {
+                skyHdrTexture = texture;
+                console.log('HDR charge: 754.hdr');
+            })
+            .catch((err) => {
+                console.error('Echec chargement HDR:', err);
+                console.info('Si la page est ouverte en file://, lance un serveur local HTTP.');
+            });
+
+        animate();
+    </script>
+</body>
+</html>

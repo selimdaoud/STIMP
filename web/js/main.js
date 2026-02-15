@@ -5,15 +5,15 @@ import {
     setTrueRollStrength, getTrueRollStrength,
     TR_GRID_SIZE, TR_WORLD_SIZE, HEIGHT_SCALE, TR_TARGET_AMP
 } from './terrain.js';
+import { greenSignedDistance, generateShapeSeeds, getShapeSeeds, greenBoundingRadius } from './greenShape.js';
+import { createGreenMaterial } from './greenShader.js';
 
 // ---- Constants (match Python) ----
-const GREEN_SIZE = 10.0;
 const GREEN_COLOR = new THREE.Color(0.08, 0.55, 0.24);
 const BG_COLOR = new THREE.Color(0.08, 0.09, 0.11);
 const BALL_RADIUS_M = 0.0215;
 const HOLE_RADIUS_M = 2.0 * BALL_RADIUS_M;
 const CAMERA_HEIGHT = 5.0;
-const TR_COLOR_CONTRAST = 5.0;
 const BALL_CIRCLE_RADIUS_DEFAULT = 3.0;
 const BALL_CIRCLE_MIN = 1.0;
 const BALL_CIRCLE_MAX = 5.5;
@@ -26,7 +26,7 @@ const BOUNCE_FRICTION = 0.8;
 const MIN_BOUNCE_VEL = 0.05;
 const LANDING_THRESHOLD = 0.001;
 const STIMP_DEFAULT = 3.0;
-const MAX_GHOST_DIST = 0.35;  // max ghost rest distance from hole for valid aim point (meters)
+const MAX_GHOST_DIST = 0.40;  // max ghost rest distance from hole for valid hole-in (meters)
 const ANGLE_STEP_DEG = 0.1;
 const ANGLE_MAX_DEG = 5.0;
 const LAUNCH_ANGLE_DEFAULT = 5;
@@ -94,19 +94,35 @@ controls.update();
 // ---- Build terrain ----
 buildTrueRollGrids(null);
 
-// ---- Create green mesh ----
+// ---- Create green mesh (organic SDF shape + procedural grass shader) ----
+let greenMaterial = null;
+
 function buildGreenMesh() {
     const gridSize = TR_GRID_SIZE;
     const halfWorld = TR_WORLD_SIZE / 2;
-    const halfGreen = GREEN_SIZE / 2;
     const step = TR_WORLD_SIZE / (gridSize - 1);
     const holeMargin = HOLE_RADIUS_M + 0.02;
+    const sdfMargin = 0.5; // include quads near the edge; shader does pixel-precise discard
 
+    // Build shared vertex grid with per-vertex normals for smooth shading
+    const vertMap = new Int32Array(gridSize * gridSize).fill(-1);
     const positions = [];
-    const colors = [];
     const normals = [];
     const indices = [];
-    let vertIdx = 0;
+    let vertCount = 0;
+
+    function getOrCreateVertex(ix, iz) {
+        const key = iz * gridSize + ix;
+        if (vertMap[key] >= 0) return vertMap[key];
+        const x = -halfWorld + ix * step;
+        const z = -halfWorld + iz * step;
+        const h = getTerrainHeight(x, z);
+        const n = getTerrainNormal(x, z);
+        positions.push(x, h, z);
+        normals.push(n.x, n.y, n.z);
+        vertMap[key] = vertCount;
+        return vertCount++;
+    }
 
     for (let iy = 0; iy < gridSize - 1; iy++) {
         for (let ix = 0; ix < gridSize - 1; ix++) {
@@ -116,43 +132,27 @@ function buildGreenMesh() {
             const z1 = z0 + step;
 
             const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
-            if (Math.abs(cx) > halfGreen || Math.abs(cz) > halfGreen) continue;
+            if (greenSignedDistance(cx, cz) > sdfMargin) continue;
             if (Math.hypot(cx, cz) < holeMargin) continue;
 
-            const h00 = getTerrainHeight(x0, z0);
-            const h10 = getTerrainHeight(x1, z0);
-            const h01 = getTerrainHeight(x0, z1);
-            const h11 = getTerrainHeight(x1, z1);
+            const v00 = getOrCreateVertex(ix, iy);
+            const v10 = getOrCreateVertex(ix + 1, iy);
+            const v01 = getOrCreateVertex(ix, iy + 1);
+            const v11 = getOrCreateVertex(ix + 1, iy + 1);
 
-            const avgH = (h00 + h10 + h01 + h11) / 4;
-            const variation = TR_TARGET_AMP > 0
-                ? (avgH / (TR_TARGET_AMP * HEIGHT_SCALE)) * 0.1 * TR_COLOR_CONTRAST
-                : 0;
-            const r = Math.max(0, Math.min(1, GREEN_COLOR.r + variation * 0.3));
-            const g = Math.max(0, Math.min(1, GREEN_COLOR.g + variation * 0.5));
-            const b = Math.max(0, Math.min(1, GREEN_COLOR.b + variation * 0.3));
-
-            const n = getTerrainNormal(cx, cz);
-
-            positions.push(x0, h00, z0, x1, h10, z0, x1, h11, z1, x0, h01, z1);
-            for (let k = 0; k < 4; k++) {
-                colors.push(r, g, b);
-                normals.push(n.x, n.y, n.z);
-            }
-            indices.push(vertIdx, vertIdx + 2, vertIdx + 1);
-            indices.push(vertIdx, vertIdx + 3, vertIdx + 2);
-            vertIdx += 4;
+            indices.push(v00, v11, v10);
+            indices.push(v00, v01, v11);
         }
     }
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
     geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
     geometry.setIndex(indices);
 
-    const material = new THREE.MeshLambertMaterial({ vertexColors: true });
-    return new THREE.Mesh(geometry, material);
+    const { seedA, seedB } = getShapeSeeds();
+    greenMaterial = createGreenMaterial(seedA, seedB);
+    return new THREE.Mesh(geometry, greenMaterial);
 }
 
 let greenMesh = buildGreenMesh();
@@ -214,17 +214,43 @@ function buildHole() {
 const holeGroup = buildHole();
 worldGroup.add(holeGroup);
 
-// ---- Create ball ----
+// ---- Create ball (white with glow) ----
 function buildBall() {
     const geometry = new THREE.SphereGeometry(BALL_RADIUS_M, 24, 16);
-    const material = new THREE.MeshLambertMaterial({ color: 0xf5f5f5 });
+    const material = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        emissive: 0xffffff,
+        emissiveIntensity: 0.3,
+        roughness: 0.3,
+        metalness: 0.0
+    });
     const mesh = new THREE.Mesh(geometry, material);
 
-    const stripeGeo = new THREE.TorusGeometry(BALL_RADIUS_M * 1.001, BALL_RADIUS_M * 0.06, 8, 32);
+    // Red stripes on two perpendicular hemispheres
     const stripeMat = new THREE.MeshBasicMaterial({ color: 0xcc2020 });
-    const stripe = new THREE.Mesh(stripeGeo, stripeMat);
-    stripe.rotation.x = Math.PI / 2;
-    mesh.add(stripe);
+
+    const stripe1Geo = new THREE.TorusGeometry(BALL_RADIUS_M * 1.001, BALL_RADIUS_M * 0.06, 8, 32);
+    const stripe1 = new THREE.Mesh(stripe1Geo, stripeMat);
+    stripe1.rotation.x = Math.PI / 2;
+    mesh.add(stripe1);
+
+    const stripe2Geo = new THREE.TorusGeometry(BALL_RADIUS_M * 1.001, BALL_RADIUS_M * 0.06, 8, 32);
+    const stripe2 = new THREE.Mesh(stripe2Geo, stripeMat);
+    // Perpendicular to the first stripe
+    stripe2.rotation.z = Math.PI / 2;
+    mesh.add(stripe2);
+
+    // Subtle glow halo around the ball
+    const glowGeo = new THREE.SphereGeometry(BALL_RADIUS_M * 2.5, 16, 12);
+    const glowMat = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.12,
+        depthWrite: false,
+        side: THREE.BackSide
+    });
+    const glow = new THREE.Mesh(glowGeo, glowMat);
+    mesh.add(glow);
 
     return mesh;
 }
@@ -272,6 +298,7 @@ let flowMode = 0; // 0=off, 1=streamlines, 2=grid, 3=break arrows
 // Aim
 let aimWorld = new THREE.Vector3(ballPos[0], 0, ballPos[2]);
 const mouseNDC = new THREE.Vector2(0, 0);
+let aimLocked = false; // true once the player clicks to set an aimpoint
 
 // Shot aim point storage
 let shotAimPoints = [];
@@ -292,11 +319,11 @@ const GAME_HOLES = [
     { slope: 1.5, stimp: 3.0, trueRoll: 0.5, distance: 2.5, seed: 1002 },
     { slope: 2.0, stimp: 3.5, trueRoll: 0.5, distance: 3.0, seed: 1003 },
     { slope: 2.5, stimp: 3.5, trueRoll: 1.0, distance: 3.0, seed: 1004 },
-    { slope: 3.0, stimp: 4.0, trueRoll: 1.0, distance: 3.5, seed: 1005 },
-    { slope: 3.0, stimp: 4.5, trueRoll: 1.5, distance: 3.5, seed: 1006 },
-    { slope: 3.5, stimp: 5.0, trueRoll: 1.5, distance: 4.0, seed: 1007 },
-    { slope: 4.0, stimp: 5.5, trueRoll: 2.0, distance: 4.5, seed: 1008 },
-    { slope: 5.0, stimp: 6.0, trueRoll: 2.0, distance: 5.0, seed: 1009 },
+    { slope: 3.0, stimp: 3.5, trueRoll: 1.0, distance: 3.5, seed: 1005 },
+    { slope: 3.0, stimp: 3.5, trueRoll: 1.5, distance: 3.5, seed: 1006 },
+    { slope: 3.5, stimp: 3.5, trueRoll: 1.5, distance: 4.0, seed: 1007 },
+    { slope: 4.0, stimp: 3.5, trueRoll: 2.0, distance: 4.5, seed: 1008 },
+    { slope: 5.0, stimp: 3.5, trueRoll: 2.0, distance: 5.0, seed: 1009 },
 ];
 
 // ===================================================================
@@ -368,22 +395,61 @@ const aimLine = new THREE.Line(aimLineGeo, aimLineMat);
 worldGroup.add(aimLine);
 
 const aimDot = new THREE.Mesh(
-    new THREE.SphereGeometry(BALL_RADIUS_M, 8, 8),
-    new THREE.MeshBasicMaterial({ color: 0xe61a1a })
+    new THREE.SphereGeometry(BALL_RADIUS_M * 1.2, 8, 8),
+    new THREE.MeshBasicMaterial({ color: 0xe61a1a, depthTest: false })
 );
+aimDot.renderOrder = 999;
 worldGroup.add(aimDot);
+
+// Aim distance popup (temporary label near aimDot)
+const aimPopup = document.createElement('div');
+aimPopup.style.cssText = `
+    position: absolute; pointer-events: none; display: none;
+    background: rgba(0,0,0,0.75); border: 1px solid rgba(255,255,255,0.4);
+    color: #fff; padding: 4px 8px; border-radius: 4px;
+    font-family: 'Courier New', monospace; font-size: 12px;
+    white-space: nowrap; z-index: 30; transform: translate(-50%, -120%);
+`;
+document.getElementById('hud').appendChild(aimPopup);
+let aimPopupTimer = null;
+
+function showAimPopup(screenX, screenY) {
+    // Perpendicular distance from hole (0,0) to aim line (ball → aimDot)
+    const bx = ballPos[0], bz = ballPos[2];
+    const ax = aimWorld.x, az = aimWorld.z;
+    const dx = ax - bx, dz = az - bz;
+    const lineLen = Math.hypot(dx, dz);
+    if (lineLen < 0.001) return;
+
+    // Signed perpendicular distance: |cross(ball→aim, ball→hole)| / |ball→aim|
+    const crossVal = (ax - bx) * (0 - bz) - (az - bz) * (0 - bx);
+    const perpDist = Math.abs(crossVal) / lineLen;
+    const ballDiam = 2 * BALL_RADIUS_M;
+    const nBalls = perpDist / ballDiam;
+    const cm = perpDist * 100;
+
+    aimPopup.textContent = `${nBalls.toFixed(1)} balls (${cm.toFixed(1)} cm)`;
+    aimPopup.style.left = screenX + 'px';
+    aimPopup.style.top = screenY + 'px';
+    aimPopup.style.display = 'block';
+
+    if (aimPopupTimer) clearTimeout(aimPopupTimer);
+    aimPopupTimer = setTimeout(() => { aimPopup.style.display = 'none'; }, 2000);
+}
 
 // ===================================================================
 // SHOT AIM POINT MARKERS
 // ===================================================================
 const aimPtGroup = new THREE.Group();
 worldGroup.add(aimPtGroup);
-const aimPtGeo = new THREE.SphereGeometry(BALL_RADIUS_M, 8, 8);
-const aimPtMatRed = new THREE.MeshBasicMaterial({ color: 0xe61a1a });
+const aimPtGeo = new THREE.SphereGeometry(BALL_RADIUS_M * 1.0, 8, 8);
+const aimPtMatYellow = new THREE.MeshBasicMaterial({ color: 0xf0d259 });
 const aimPtMatBlue = new THREE.MeshBasicMaterial({ color: 0x1a7ae6 });
 
 function addAimPointMarker(pt) {
-    const mesh = new THREE.Mesh(aimPtGeo, aimPtMatRed.clone());
+    const mat = new THREE.MeshBasicMaterial({ color: 0xf0d259, depthTest: false }); // yellow — shot marker
+    const mesh = new THREE.Mesh(aimPtGeo, mat);
+    mesh.renderOrder = 998;
     mesh.position.set(pt.x, pt.y + 0.02, pt.z);
     aimPtGroup.add(mesh);
 }
@@ -391,7 +457,10 @@ function addAimPointMarker(pt) {
 function colorLastAimPoint(madeIt) {
     if (aimPtGroup.children.length === 0) return;
     const last = aimPtGroup.children[aimPtGroup.children.length - 1];
-    last.material.color.copy(madeIt ? aimPtMatBlue.color : aimPtMatRed.color);
+    // Yellow stays for miss, blue for made it
+    if (madeIt) {
+        last.material.color.copy(aimPtMatBlue.color);
+    }
     if (madeIt) {
         validAimPts.push({ x: last.position.x, z: last.position.z });
         rebuildGoodAimZone();
@@ -520,12 +589,197 @@ function simulateGhostRest(startPos, startVel, startSpin) {
 
         px = nx; py = ny; pz = nz;
 
-        // Safety: stop if off green
-        const half = GREEN_SIZE / 2;
-        if (Math.abs(px) > half || Math.abs(pz) > half) break;
+        // Safety: stop if off green (organic SDF boundary)
+        if (greenSignedDistance(px, pz) > 0) break;
     }
 
     return { x: px, z: pz };
+}
+
+// ===================================================================
+// HINT SYSTEM — solve & display ideal trajectory in Game mode
+// ===================================================================
+const hintGroup = new THREE.Group();
+worldGroup.add(hintGroup);
+let hintUsedThisHole = false;
+const hintBtn = document.getElementById('hint-btn');
+
+/**
+ * Simulate a putt and record the path.
+ * Includes lip gravity (unlike simulateGhostRest).
+ * Returns { path: [[x,y,z],...], hitHole, holeSpeed }.
+ */
+function simulateTrajectory(startPos, vel) {
+    const simDt = 1 / 120;
+    let px = startPos[0], py = startPos[1], pz = startPos[2];
+    let vx = vel[0], vy = 0, vz = vel[1];
+    let spin = 0;
+    let airborne = false;
+    const angleRad = angleDeg * Math.PI / 180;
+    const muRoll = stimpToMu(stimpM);
+    const path = [[px, py, pz]];
+    let hitHole = false;
+    let holeSpeed = Infinity;
+    let minDistToHole = Infinity;
+    const recordEvery = 4; // record every N steps
+
+    for (let step = 0; step < 20000; step++) {
+        const speed = Math.hypot(vx, vz);
+        if (speed < 0.02 && !airborne) break;
+
+        const terrainH = getTerrainHeight(px, pz);
+        const heightAbove = py - BALL_RADIUS_M - terrainH;
+        airborne = heightAbove > LANDING_THRESHOLD;
+
+        let ax = 0, ay = -GRAVITY, az = 0;
+
+        if (!airborne) {
+            az += GRAVITY * Math.sin(angleRad) * ROLLING_FACTOR;
+            if (speed > 1e-4) {
+                const normal = getTerrainNormal(px, pz);
+                let friction = muRoll * GRAVITY * Math.abs(normal.y);
+                let spinMod = 1.0 + spin * SPIN_EFFECT_STRENGTH;
+                spinMod = Math.max(0.5, Math.min(1.5, spinMod));
+                ax -= friction * spinMod * (vx / speed);
+                az -= friction * spinMod * (vz / speed);
+                ax += -normal.x * GRAVITY * ROLLING_FACTOR;
+                az += -normal.z * GRAVITY * ROLLING_FACTOR;
+            }
+            spin *= Math.exp(-SPIN_DECAY_RATE * simDt);
+            if (Math.abs(spin) < 0.01) spin = 0;
+            const tr = trueRollAccel(px, pz, vx, vz);
+            ax += tr.ax;
+            az += tr.az;
+
+            // Lip gravity
+            const lipOuter = HOLE_RADIUS_M * 2.3;
+            const dh = Math.hypot(px, pz);
+            if (dh > 0.001 && dh < lipOuter) {
+                const t = 1.0 - dh / lipOuter;
+                const lipForce = GRAVITY * 2.5 * t * t;
+                ax += -px / dh * lipForce;
+                az += -pz / dh * lipForce;
+            }
+
+            ay = 0;
+            vy = 0;
+        } else {
+            az += GRAVITY * Math.sin(angleRad);
+        }
+
+        vx += ax * simDt;
+        vy += ay * simDt;
+        vz += az * simDt;
+        let nx = px + vx * simDt;
+        let ny = py + vy * simDt;
+        let nz = pz + vz * simDt;
+
+        const minY = getTerrainHeight(nx, nz) + BALL_RADIUS_M;
+        if (ny < minY) {
+            ny = minY; vy = 0; airborne = false;
+        }
+        px = nx; py = ny; pz = nz;
+
+        // Record path
+        if (step % recordEvery === 0) path.push([px, py, pz]);
+
+        // Check hole
+        const distH = Math.hypot(px, pz);
+        if (distH < minDistToHole) minDistToHole = distH;
+        if (distH <= HOLE_RADIUS_M + BALL_RADIUS_M * 0.5) {
+            hitHole = true;
+            holeSpeed = speed;
+            path.push([px, py, pz]);
+            break;
+        }
+
+        if (greenSignedDistance(px, pz) > 0) break;
+    }
+
+    return { path, hitHole, holeSpeed, minDistToHole };
+}
+
+/**
+ * Search over angles and speeds to find the trajectory that enters the hole
+ * with the lowest speed (most likely to drop in).
+ */
+function solveHintTrajectory() {
+    const bx = ballPos[0], bz = ballPos[2], by = ballPos[1];
+    let bestPath = null;
+    let bestSpeed = Infinity;
+
+    for (let deg = 0; deg < 360; deg += 1) {
+        const rad = deg * Math.PI / 180;
+        const dx = Math.cos(rad), dz = Math.sin(rad);
+
+        // Binary search on aim distance (0.3m to 6m)
+        let lo = 0.3, hi = 6.0;
+        let found = false;
+        let foundPath = null;
+        let foundSpeed = Infinity;
+
+        for (let iter = 0; iter < 18; iter++) {
+            const mid = (lo + hi) / 2;
+            const speedH = STIMP_V0 * Math.sqrt(mid / stimpM);
+            const result = simulateTrajectory(
+                [bx, by, bz],
+                [speedH * dx, speedH * dz]
+            );
+            if (result.hitHole) {
+                hi = mid; // try slower
+                found = true;
+                foundPath = result.path;
+                foundSpeed = result.holeSpeed;
+            } else {
+                // Ball missed — use closest approach to decide
+                // If ball got close but passed, it was too fast; otherwise too slow
+                if (result.minDistToHole < HOLE_RADIUS_M * 4) {
+                    hi = mid; // overshot — reduce speed
+                } else {
+                    lo = mid; // undershot — increase speed
+                }
+            }
+        }
+
+        if (found && foundSpeed < bestSpeed) {
+            bestSpeed = foundSpeed;
+            bestPath = foundPath;
+        }
+    }
+
+    return bestPath;
+}
+
+function clearHint() {
+    while (hintGroup.children.length) {
+        const c = hintGroup.children[0];
+        hintGroup.remove(c);
+        if (c.geometry) c.geometry.dispose();
+        if (c.material) c.material.dispose();
+    }
+}
+
+function showHint() {
+    if (hintUsedThisHole) return;
+    clearHint();
+
+    const path = solveHintTrajectory();
+    if (!path || path.length < 2) return;
+
+    // Build a CatmullRomCurve3 through the path points
+    const points = path.map(p => new THREE.Vector3(p[0], p[1] + 0.002, p[2]));
+    const curve = new THREE.CatmullRomCurve3(points, false);
+    const tubeGeo = new THREE.TubeGeometry(curve, Math.min(points.length * 2, 200), BALL_RADIUS_M, 8, false);
+    const tubeMat = new THREE.MeshBasicMaterial({
+        color: 0x999999, transparent: true, opacity: 0.45,
+        depthTest: false, side: THREE.DoubleSide
+    });
+    const tubeMesh = new THREE.Mesh(tubeGeo, tubeMat);
+    tubeMesh.renderOrder = 995;
+    hintGroup.add(tubeMesh);
+
+    hintUsedThisHole = true;
+    hintBtn.classList.add('used');
 }
 
 // ===================================================================
@@ -674,7 +928,7 @@ function rebuildGoodAimZone() {
         eGeo.setAttribute('position', new THREE.Float32BufferAttribute(eVerts, 3));
         const eMat = new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false });
         const ellipseLine = new THREE.Line(eGeo, eMat);
-        ellipseLine.renderOrder = 997;
+        ellipseLine.renderOrder = 1000;
         goodAimGroup.add(ellipseLine);
     }
 
@@ -782,7 +1036,7 @@ function buildGradientArrows() {
         if (c.geometry) c.geometry.dispose();
     }
 
-    const halfGreen = GREEN_SIZE / 2;
+    const halfWorld = TR_WORLD_SIZE / 2;
     const spacing = 0.4;
     const arrowScale = 0.25;
     const headRatio = 0.3;
@@ -790,8 +1044,9 @@ function buildGradientArrows() {
     const positions = [];
     const colors = [];
 
-    for (let x = -halfGreen + spacing; x < halfGreen; x += spacing) {
-        for (let z = -halfGreen + spacing; z < halfGreen; z += spacing) {
+    for (let x = -halfWorld + spacing; x < halfWorld; x += spacing) {
+        for (let z = -halfWorld + spacing; z < halfWorld; z += spacing) {
+            if (greenSignedDistance(x, z) > -0.3) continue; // only inside green
             if (Math.hypot(x, z) < HOLE_RADIUS_M * 3) continue;
 
             const { gx, gz } = getGradientAt(x, z, angleDeg);
@@ -854,7 +1109,6 @@ let flowLastStimp = STIMP_DEFAULT;
 let flowPointsObj = null;
 
 function traceStreamline(startX, startZ) {
-    const half = GREEN_SIZE / 2;
     const stepSize = 0.04;
     let x = startX, z = startZ;
     const points = [[x, z]];
@@ -867,7 +1121,7 @@ function traceStreamline(startX, startZ) {
         // Step along gradient direction (pure fall-line)
         x += (g.gx / mag) * stepSize;
         z += (g.gz / mag) * stepSize;
-        if (Math.abs(x) > half - 0.1 || Math.abs(z) > half - 0.1) break;
+        if (greenSignedDistance(x, z) > -0.1) break;
         if (Math.hypot(x, z) < HOLE_RADIUS_M * 1.5) { points.push([x, z]); break; }
         const last = points[points.length - 1];
         const ddx = x - last[0], ddz = z - last[1];
@@ -884,24 +1138,23 @@ function rebuildFlowVisuals() {
     }
     flowPointsObj = null;
 
-    // Seed from all four edges of the green — lines that start on the
+    // Seed from points around the green boundary — lines that start on the
     // uphill side will trace long paths; downhill seeds exit quickly and
     // get filtered out by the minimum-length check.
-    const half = GREEN_SIZE / 2;
-    const spacing = 0.15;
-    const margin = 0.2;
-    const edge = half - margin;
+    const halfWorld = TR_WORLD_SIZE / 2;
+    const spacing = 0.21;
     flowStreamlines = [];
 
-    for (let t = -edge; t <= edge; t += spacing) {
-        // Top edge (z = -edge)
-        { const line = traceStreamline(t, -edge); if (line.length >= 8) flowStreamlines.push(line); }
-        // Bottom edge (z = +edge)
-        { const line = traceStreamline(t,  edge); if (line.length >= 8) flowStreamlines.push(line); }
-        // Left edge (x = -edge)
-        { const line = traceStreamline(-edge, t); if (line.length >= 8) flowStreamlines.push(line); }
-        // Right edge (x = +edge)
-        { const line = traceStreamline( edge, t); if (line.length >= 8) flowStreamlines.push(line); }
+    // Scan the full world grid and seed from points near the green edge
+    for (let x = -halfWorld; x <= halfWorld; x += spacing) {
+        for (let z = -halfWorld; z <= halfWorld; z += spacing) {
+            const sd = greenSignedDistance(x, z);
+            // Seed from points just inside the edge
+            if (sd > -0.5 && sd < -0.05) {
+                const line = traceStreamline(x, z);
+                if (line.length >= 8) flowStreamlines.push(line);
+            }
+        }
     }
 
     // Init particles (staggered)
@@ -1000,7 +1253,7 @@ let gridFlowLastAngle = 0;
 let gridFlowLastStimp = STIMP_DEFAULT;
 
 // Pick the neighboring grid intersection most aligned with the gradient
-function pickGridTarget(x, z, sp, edge) {
+function pickGridTarget(x, z, sp) {
     const g = getGradientAt(x, z, angleDeg);
     const mag = Math.hypot(g.gx, g.gz);
     if (mag < 0.01) return null; // no meaningful slope
@@ -1016,8 +1269,8 @@ function pickGridTarget(x, z, sp, edge) {
     let bestDot = -Infinity, bestN = null;
     for (const n of neighbors) {
         const nx = x + n.dx, nz = z + n.dz;
-        // Stay within grid bounds
-        if (Math.abs(nx) > edge + 0.001 || Math.abs(nz) > edge + 0.001) continue;
+        // Stay within green boundary
+        if (greenSignedDistance(nx, nz) > -0.1) continue;
         const dot = g.gx * n.dx + g.gz * n.dz;
         if (dot > bestDot) { bestDot = dot; bestN = { x: nx, z: nz }; }
     }
@@ -1035,13 +1288,11 @@ function rebuildGridFlow() {
     gridFlowPointsObj = null;
     gridFlowParticles = [];
 
-    const half = GREEN_SIZE / 2;
-    const margin = 0.2;
-    const edge = half - margin;
+    const halfWorld = TR_WORLD_SIZE / 2;
     const sp = GRID_FLOW_SPACING;
     const yOff = 0.008;
 
-    // Build grid lines geometry
+    // Build grid lines geometry — only inside the organic green shape
     const positions = [];
     const gridLineMat = new THREE.LineBasicMaterial({
         color: new THREE.Color(0.5, 0.7, 0.9),
@@ -1049,18 +1300,22 @@ function rebuildGridFlow() {
     });
 
     // Horizontal lines (constant z, varying x)
-    for (let z = -edge; z <= edge + 0.001; z += sp) {
-        for (let x = -edge; x <= edge - sp + 0.001; x += sp) {
-            const x1 = x, x2 = Math.min(x + sp, edge);
-            positions.push(x1, getTerrainHeight(x1, z) + yOff, z);
+    for (let z = -halfWorld; z <= halfWorld + 0.001; z += sp) {
+        for (let x = -halfWorld; x <= halfWorld - sp + 0.001; x += sp) {
+            const x2 = x + sp;
+            const mx = (x + x2) / 2;
+            if (greenSignedDistance(mx, z) > -0.1) continue;
+            positions.push(x, getTerrainHeight(x, z) + yOff, z);
             positions.push(x2, getTerrainHeight(x2, z) + yOff, z);
         }
     }
     // Vertical lines (constant x, varying z)
-    for (let x = -edge; x <= edge + 0.001; x += sp) {
-        for (let z = -edge; z <= edge - sp + 0.001; z += sp) {
-            const z1 = z, z2 = Math.min(z + sp, edge);
-            positions.push(x, getTerrainHeight(x, z1) + yOff, z1);
+    for (let x = -halfWorld; x <= halfWorld + 0.001; x += sp) {
+        for (let z = -halfWorld; z <= halfWorld - sp + 0.001; z += sp) {
+            const z2 = z + sp;
+            const mz = (z + z2) / 2;
+            if (greenSignedDistance(x, mz) > -0.1) continue;
+            positions.push(x, getTerrainHeight(x, z) + yOff, z);
             positions.push(x, getTerrainHeight(x, z2) + yOff, z2);
         }
     }
@@ -1073,11 +1328,12 @@ function rebuildGridFlow() {
         gridFlowGroup.add(lines);
     }
 
-    // One particle per grid intersection
+    // One particle per grid intersection inside the green
     let particleId = 0;
-    for (let z = -edge; z <= edge + 0.001; z += sp) {
-        for (let x = -edge; x <= edge + 0.001; x += sp) {
-            const target = pickGridTarget(x, z, sp, edge);
+    for (let z = -halfWorld; z <= halfWorld + 0.001; z += sp) {
+        for (let x = -halfWorld; x <= halfWorld + 0.001; x += sp) {
+            if (greenSignedDistance(x, z) > -0.1) continue;
+            const target = pickGridTarget(x, z, sp);
             if (!target) continue; // skip flat intersections with no downhill neighbor
             // Stagger initial progress so particles don't all move in sync
             const stagger = ((particleId * 31 + 11) % 100) / 100;
@@ -1117,9 +1373,6 @@ function updateGridFlowParticles(dt) {
     const baseSpeed = 0.1;  // minimum traversals per second
     const gradScale = 1.5;  // extra traversals/sec per unit gradient
 
-    const half = GREEN_SIZE / 2;
-    const margin = 0.2;
-    const edge = half - margin;
     const sp = GRID_FLOW_SPACING;
 
     for (let i = 0; i < gridFlowParticles.length; i++) {
@@ -1136,7 +1389,7 @@ function updateGridFlowParticles(dt) {
             // Reached target — respawn at original intersection
             p.t -= 1.0;
             // Recompute target in case gradient changed
-            const newTarget = pickGridTarget(p.spawnX, p.spawnZ, sp, edge);
+            const newTarget = pickGridTarget(p.spawnX, p.spawnZ, sp);
             if (newTarget) {
                 p.targetX = newTarget.x;
                 p.targetZ = newTarget.z;
@@ -1172,8 +1425,8 @@ function rebuildSlopeIndicator() {
     }
     if (Math.abs(angleDeg) < 0.01) return;
 
-    const halfGreen = GREEN_SIZE / 2;
-    const arrowX = -halfGreen * 0.85;
+    const halfEst = greenBoundingRadius() * 0.5;
+    const arrowX = -halfEst * 0.85;
     const yOff = 0.01;
     const arrowLen = Math.max(0.3, Math.min(1.5, Math.abs(angleDeg) * 0.15));
     const headSize = 0.12;
@@ -1198,8 +1451,8 @@ function rebuildScaleBar() {
         scaleBarGroup.remove(c);
         if (c.geometry) c.geometry.dispose();
     }
-    const halfGreen = GREEN_SIZE / 2;
-    const barZ = halfGreen * 0.9;
+    const halfEst = greenBoundingRadius() * 0.5;
+    const barZ = halfEst * 0.9;
     const yOff = 0.01;
     const numMeters = 4;
     const halfBar = numMeters / 2;
@@ -1336,8 +1589,49 @@ window.addEventListener('keydown', (e) => {
     highlightHelp(keyVal);
 });
 
+let _mouseDownPos = null;
+let _mouseDownTime = 0;
+const CLICK_MAX_MOVE = 15;
+const CLICK_MAX_TIME = 300;
+
 renderer.domElement.addEventListener('mousedown', (e) => {
     highlightHelp(e.ctrlKey || e.metaKey ? 'ctrl+drag' : 'drag');
+    _mouseDownPos = { x: e.clientX, y: e.clientY };
+    _mouseDownTime = performance.now();
+});
+
+renderer.domElement.addEventListener('mouseup', (e) => {
+    if (!_mouseDownPos) return;
+    const dist = Math.hypot(e.clientX - _mouseDownPos.x, e.clientY - _mouseDownPos.y);
+    const elapsed = performance.now() - _mouseDownTime;
+    _mouseDownPos = null;
+    if (dist < CLICK_MAX_MOVE && elapsed < CLICK_MAX_TIME && !ballMoving && inHole) {
+        resetBall(false);
+        return;
+    }
+    if (dist < CLICK_MAX_MOVE && elapsed < CLICK_MAX_TIME && !ballMoving && !inHole) {
+        // Short click — set aimpoint via raycast
+        const ndc = new THREE.Vector2(
+            (e.clientX / window.innerWidth) * 2 - 1,
+            -(e.clientY / window.innerHeight) * 2 + 1
+        );
+        _raycaster.setFromCamera(ndc, camera);
+        _invMatrix.copy(worldGroup.matrixWorld).invert();
+        const origin = _raycaster.ray.origin.clone().applyMatrix4(_invMatrix);
+        const dir = _raycaster.ray.direction.clone().transformDirection(_invMatrix);
+        if (Math.abs(dir.y) > 1e-10) {
+            const t = -origin.y / dir.y;
+            if (t > 0) {
+                const ax = origin.x + t * dir.x;
+                const az = origin.z + t * dir.z;
+                aimWorld.set(ax, getTerrainHeight(ax, az), az);
+                aimLocked = true;
+                aimDot.material.color.setHex(0xe61a1a); // red — new active aimpoint
+                clearHint();
+                showAimPopup(e.clientX, e.clientY);
+            }
+        }
+    }
 });
 
 renderer.domElement.addEventListener('wheel', () => {
@@ -1382,12 +1676,14 @@ const slAngle  = document.getElementById('sl-angle');
 const slStimp  = document.getElementById('sl-stimp');
 const slTroll  = document.getElementById('sl-troll');
 const slDist   = document.getElementById('sl-dist');
+const slPos    = document.getElementById('sl-pos');
 const slLaunch = document.getElementById('sl-launch');
 
 const valAngle  = document.getElementById('val-angle');
 const valStimp  = document.getElementById('val-stimp');
 const valTroll  = document.getElementById('val-troll');
 const valDist   = document.getElementById('val-dist');
+const valPos    = document.getElementById('val-pos');
 const valLaunch = document.getElementById('val-launch');
 
 slAngle.addEventListener('input', () => {
@@ -1412,6 +1708,14 @@ slDist.addEventListener('input', () => {
     valDist.textContent = ballCircleRadius.toFixed(1);
     updateBallOnCircle();
 });
+slPos.addEventListener('input', () => {
+    if (gameState) { syncSlidersFromState(); return; }
+    if (ballMoving || !ballOnCircle) return;
+    ballAngle = parseFloat(slPos.value) * Math.PI / 180;
+    lastCircleAngle = ballAngle;
+    valPos.textContent = Math.round(parseFloat(slPos.value));
+    updateBallOnCircle();
+});
 slLaunch.addEventListener('input', () => {
     if (gameState) { syncSlidersFromState(); return; }
     launchAngleDeg = parseInt(slLaunch.value, 10);
@@ -1424,11 +1728,13 @@ function syncSlidersFromState() {
     slStimp.value  = stimpM;
     slTroll.value  = getTrueRollStrength();
     slDist.value   = ballCircleRadius;
+    slPos.value    = Math.round(ballAngle * 180 / Math.PI) % 360;
     slLaunch.value = launchAngleDeg;
     valAngle.textContent  = angleDeg.toFixed(1);
     valStimp.textContent  = stimpM.toFixed(1);
     valTroll.textContent  = getTrueRollStrength().toFixed(1);
     valDist.textContent   = ballCircleRadius.toFixed(1);
+    valPos.textContent    = Math.round(ballAngle * 180 / Math.PI) % 360;
     valLaunch.textContent = launchAngleDeg;
 }
 
@@ -1436,6 +1742,17 @@ function syncSlidersFromState() {
 document.getElementById('shoot-btn').addEventListener('click', (e) => {
     e.preventDefault();
     if (!ballMoving && !inHole && (!gameState || gameState === 'putting')) shoot();
+});
+
+hintBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    if (gameState === 'putting' && !hintUsedThisHole) showHint();
+});
+
+const flowBtn = document.getElementById('flow-btn');
+flowBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    cycleFlowMode();
 });
 
 document.getElementById('action-btns').addEventListener('click', (e) => {
@@ -1465,6 +1782,37 @@ window.addEventListener('pointerup', () => {
     }
 });
 
+// ---- Light debug sliders (inside slider panel) ----
+{
+    const ldSection = document.getElementById('ld-section');
+    if (window.SHOW_LIGHT_DEBUG) ldSection.style.display = 'block';
+
+    const ldSliders = [
+        { id: 'ld-diffuse',  valId: 'ld-v-diffuse',  uniform: 'uEnDiffuse',    decimals: 2 },
+        { id: 'ld-ambient',  valId: 'ld-v-ambient',   uniform: 'uEnAmbient',    decimals: 2 },
+        { id: 'ld-specular', valId: 'ld-v-specular',  uniform: 'uEnSpecular',   decimals: 2 },
+        { id: 'ld-fresnel',  valId: 'ld-v-fresnel',   uniform: 'uEnFresnel',    decimals: 2 },
+        { id: 'ld-slope',    valId: 'ld-v-slope',     uniform: 'uSlopeAmplify', decimals: 0 },
+    ];
+    for (const s of ldSliders) {
+        const slider = document.getElementById(s.id);
+        const valSpan = document.getElementById(s.valId);
+        slider.addEventListener('input', () => {
+            const v = parseFloat(slider.value);
+            valSpan.textContent = v.toFixed(s.decimals);
+            greenMaterial.uniforms[s.uniform].value = v;
+        });
+    }
+    // DirLight (Three.js scene light, not a shader uniform)
+    const dlSlider = document.getElementById('ld-dirlight');
+    const dlVal = document.getElementById('ld-v-dirlight');
+    dlSlider.addEventListener('input', () => {
+        const v = parseFloat(dlSlider.value);
+        dlVal.textContent = v.toFixed(2);
+        dirLight.intensity = v;
+    });
+}
+
 // ---- Touch aiming (tap on canvas to set aim point) ----
 let _touchStartPos = null;
 let _touchStartTime = 0;
@@ -1485,9 +1833,32 @@ renderer.domElement.addEventListener('touchend', (e) => {
     const dist = Math.hypot(t.clientX - _touchStartPos.x, t.clientY - _touchStartPos.y);
     const elapsed = performance.now() - _touchStartTime;
     _touchStartPos = null;
-    if (dist < TAP_MAX_MOVE && elapsed < TAP_MAX_TIME) {
-        mouseNDC.x = (t.clientX / window.innerWidth) * 2 - 1;
-        mouseNDC.y = -(t.clientY / window.innerHeight) * 2 + 1;
+    if (dist < TAP_MAX_MOVE && elapsed < TAP_MAX_TIME && !ballMoving && inHole) {
+        resetBall(false);
+        return;
+    }
+    if (dist < TAP_MAX_MOVE && elapsed < TAP_MAX_TIME && !ballMoving && !inHole) {
+        // Short tap — set aimpoint via raycast
+        const ndc = new THREE.Vector2(
+            (t.clientX / window.innerWidth) * 2 - 1,
+            -(t.clientY / window.innerHeight) * 2 + 1
+        );
+        _raycaster.setFromCamera(ndc, camera);
+        _invMatrix.copy(worldGroup.matrixWorld).invert();
+        const origin = _raycaster.ray.origin.clone().applyMatrix4(_invMatrix);
+        const dir = _raycaster.ray.direction.clone().transformDirection(_invMatrix);
+        if (Math.abs(dir.y) > 1e-10) {
+            const tt = -origin.y / dir.y;
+            if (tt > 0) {
+                const ax = origin.x + tt * dir.x;
+                const az = origin.z + tt * dir.z;
+                aimWorld.set(ax, getTerrainHeight(ax, az), az);
+                aimLocked = true;
+                aimDot.material.color.setHex(0xe61a1a); // red — new active aimpoint
+                clearHint();
+                showAimPopup(t.clientX, t.clientY);
+            }
+        }
     }
 }, { passive: true });
 
@@ -1527,9 +1898,12 @@ function startGame() {
     sliderPanel.style.display = 'none';
     document.getElementById('action-btns').style.display = 'none';
     gameOverEl.classList.remove('show');
-    // Show game HUD + exit button
-    gameHudEl.style.display = '';
+    // Show game HUD + exit button + hint
+    gameHudEl.style.display = 'block';
     gameExitLiveEl.style.display = 'block';
+    hintBtn.style.display = 'block';
+    hintBtn.classList.remove('used');
+    flowBtn.style.display = 'block';
     updateScorecard();
     setupHole(0);
 }
@@ -1547,6 +1921,7 @@ function setupHole(index) {
     clearAllTrails();
     shotAimPoints = [];
     clearAimPointMarkers();
+    generateShapeSeeds();
     buildTrueRollGrids(hole.seed);
     worldGroup.remove(greenMesh);
     greenMesh.geometry.dispose();
@@ -1578,6 +1953,11 @@ function setupHole(index) {
 
     gameCrossedHole = false;
     gameState = 'putting';
+
+    // Reset hint for this hole
+    clearHint();
+    hintUsedThisHole = false;
+    hintBtn.classList.remove('used');
 
     // Update game HUD
     gameHoleEl.textContent = `Hole ${index + 1}/9`;
@@ -1639,6 +2019,9 @@ function endGame() {
     gameState = 'gameover';
     gameHudEl.style.display = 'none';
     gameExitLiveEl.style.display = 'none';
+    hintBtn.style.display = 'none';
+    flowBtn.style.display = 'none';
+    clearHint();
 
     let grade;
     if (gameScore >= 81) grade = 'GOAT';
@@ -1657,6 +2040,9 @@ function exitGame() {
     gameOverEl.classList.remove('show');
     gameHudEl.style.display = 'none';
     gameExitLiveEl.style.display = 'none';
+    hintBtn.style.display = 'none';
+    flowBtn.style.display = 'none';
+    clearHint();
     scorePopupEl.classList.remove('show');
     // Restore free-play UI
     statsEl.style.display = '';
@@ -1686,6 +2072,10 @@ function shoot() {
     const dirZ = aimWorld.z - ballPos[2];
     const len = Math.hypot(dirX, dirZ);
     if (len < 1e-6) return;
+
+    // Mark aimDot yellow — previous shot aimpoint
+    aimDot.material.color.setHex(0xf0d259);
+    clearHint();
 
     lastShotStartPos = { x: ballPos[0], z: ballPos[2] };
 
@@ -1738,6 +2128,8 @@ function resetBall(newTerrain) {
     ballMoving = false;
     ballOnCircle = true;
     ballAirborne = false;
+    aimLocked = false;
+    aimDot.material.color.setHex(0xe61a1a); // red — no aimpoint chosen yet
     inHole = false;
     bounceCount = 0;
     maxHeight = 0.0;
@@ -1753,6 +2145,7 @@ function resetBall(newTerrain) {
         clearAllTrails();
         shotAimPoints = [];
         clearAimPointMarkers();
+        generateShapeSeeds();
         buildTrueRollGrids(null);
         worldGroup.remove(greenMesh);
         greenMesh.geometry.dispose();
@@ -1833,6 +2226,19 @@ function updatePhysics(dt) {
         const tr = trueRollAccel(ballPos[0], ballPos[2], ballVel[0], ballVel[2]);
         ax += tr.ax;
         az += tr.az;
+
+        // Lip gravity — radial force toward hole center when ball is on the lip
+        {
+            const lipOuter = HOLE_RADIUS_M * 2.3;  // influence zone ~2.3× hole radius
+            const dh = Math.hypot(ballPos[0], ballPos[2]);
+            if (dh > 0.001 && dh < lipOuter) {
+                // Force ramps up as ball approaches hole edge, peaks at rim
+                const t = 1.0 - dh / lipOuter;  // 0 at outer edge, ~1 at center
+                const lipForce = GRAVITY * 2.5 * t * t;  // quadratic ramp
+                ax += -ballPos[0] / dh * lipForce;
+                az += -ballPos[2] / dh * lipForce;
+            }
+        }
 
         ay = 0;
         ballVel[1] = 0;
@@ -1941,18 +2347,24 @@ function updatePhysics(dt) {
             }
             ballPos[1] = holeBottom;
             inHole = true;
-            addTrailPoint(ballPos[0], ballPos[1], ballPos[2]);
 
             // Ghost rest position (where ball would stop without hole)
             const rest = simulateGhostRest(ghostPos, ghostVel, ghostSpin);
             placeGhostCross(rest.x, rest.z);
 
-            // Only turn aim point blue if ghost rest is within the collar (30cm)
+            // Valid only if ghost would have stopped within 40cm of hole
             const ghostDist = Math.hypot(rest.x, rest.z);
-            colorLastAimPoint(ghostDist <= MAX_GHOST_DIST);
+            const validHoleIn = ghostDist <= MAX_GHOST_DIST;
+            if (validHoleIn) {
+                aimDot.material.color.setHex(0x1a7ae6); // blue — valid hole-in
+                colorLastAimPoint(true);
+            } else {
+                aimDot.material.color.setHex(0xf0d259); // yellow — ball went in but too fast
+                colorLastAimPoint(false);
+            }
 
-            // Game mode scoring on hole-in
-            if (gameState === 'moving') scoreShot(false);
+            // Game mode scoring on hole-in (only if valid)
+            if (gameState === 'moving') scoreShot(!validHoleIn);
         } else if (distToHole <= HOLE_RADIUS_M) {
             // Lip-out
             ballVel[0] *= 0.92;
@@ -1965,7 +2377,11 @@ function updatePhysics(dt) {
         // Game mode scoring on miss/near
         if (gameState === 'moving') scoreShot(false);
     } else {
-        addTrailPoint(ballPos[0], ballPos[1], ballPos[2]);
+        // Don't trace trail inside the hole
+        const dTrail = Math.hypot(ballPos[0], ballPos[2]);
+        if (dTrail > HOLE_RADIUS_M) {
+            addTrailPoint(ballPos[0], ballPos[1], ballPos[2]);
+        }
     }
 
     // Break point detection (vz sign change)
@@ -1998,6 +2414,9 @@ const _raycaster = new THREE.Raycaster();
 const _invMatrix = new THREE.Matrix4();
 
 function updateAim() {
+    // When aimLocked, the aimpoint is fixed — don't follow the mouse
+    if (aimLocked) return;
+
     _raycaster.setFromCamera(mouseNDC, camera);
 
     // Transform ray into worldGroup local coords
@@ -2044,7 +2463,7 @@ function animate() {
         if (keysHeld['ArrowUp'])   angleDeg = Math.min(ANGLE_MAX_DEG, angleDeg + ANGLE_STEP_DEG);
         if (keysHeld['ArrowDown']) angleDeg = Math.max(-ANGLE_MAX_DEG, angleDeg - ANGLE_STEP_DEG);
         if (keysHeld['q'] || keysHeld['Q']) setTrueRollStrength(Math.max(0, getTrueRollStrength() - 0.1));
-        if (keysHeld['w'] || keysHeld['W']) setTrueRollStrength(Math.min(20, getTrueRollStrength() + 0.1));
+        if (keysHeld['w'] || keysHeld['W']) setTrueRollStrength(Math.min(4, getTrueRollStrength() + 0.1));
     }
 
     if (!ballMoving && ballOnCircle) {
@@ -2052,11 +2471,13 @@ function animate() {
             ballAngle += 0.035;
             lastCircleAngle = ballAngle;
             updateBallOnCircle();
+            clearHint();
         }
         if (keysHeld['ArrowRight']) {
             ballAngle -= 0.035;
             lastCircleAngle = ballAngle;
             updateBallOnCircle();
+            clearHint();
         }
     }
 
@@ -2106,21 +2527,27 @@ function animate() {
     }
 
     // ---- Aim line / dot ----
+    // aimDot is red when actively aiming (new click), yellow after a shot
+    aimDot.visible = true;
+    aimDot.position.set(aimWorld.x, aimWorld.y + 0.02, aimWorld.z);
     if (!ballMoving) {
         aimLine.visible = true;
-        aimDot.visible = true;
         const p = aimLine.geometry.attributes.position.array;
         p[0] = ballPos[0]; p[1] = ballPos[1]; p[2] = ballPos[2];
         p[3] = aimWorld.x;  p[4] = aimWorld.y + 0.005; p[5] = aimWorld.z;
         aimLine.geometry.attributes.position.needsUpdate = true;
-        aimDot.position.set(aimWorld.x, aimWorld.y + 0.02, aimWorld.z);
     } else {
         aimLine.visible = false;
-        aimDot.visible = false;
     }
 
     // ---- HUD ----
     updateHUD();
+
+    // ---- Update green shader uniforms ----
+    if (greenMaterial) {
+        greenMaterial.uniforms.uViewPos.value.copy(camera.position);
+        greenMaterial.uniforms.uLightPos.value.set(5, 10, 5);
+    }
 
     // ---- Render ----
     controls.update();
