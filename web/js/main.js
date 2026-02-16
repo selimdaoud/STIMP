@@ -40,6 +40,16 @@ const ZOOM_MIN = 1.0;
 const ZOOM_MAX = 90.0;
 const ZOOM_STEP = 5.0;
 
+// ---- Guide messages (sandbox mode) ----
+const GUIDE = {
+    WELCOME:    "Press 'H' for key helper",
+    AIM:        'Tap the green to aim or R to reset',
+    SHOOT:      'Press SPACE or SHOOT',
+    ROLLING:    '',
+    IN_HOLE:    'Click to reset',
+    RESET:      '',
+};
+
 function stimpToMu(s) {
     const v0 = 1.83;
     return v0 * v0 / (2.0 * GRAVITY * s);
@@ -292,7 +302,10 @@ let breakPoints = [];
 let breakLocked = false;
 let prevVz = null;
 let prevPosForVz = null;
-let showHelp = true;
+let showHelp = false;
+let showSpeedChart = false;
+let speedData = [];
+let speedSampleCounter = 0;
 let flowMode = 0; // 0=off, 1=streamlines, 2=grid, 3=break arrows
 
 // Aim
@@ -1029,6 +1042,185 @@ const gradientGroup = new THREE.Group();
 gradientGroup.visible = false;
 worldGroup.add(gradientGroup);
 
+const contourGroup = new THREE.Group();
+contourGroup.visible = false;
+worldGroup.add(contourGroup);
+
+function buildContourVis() {
+    while (contourGroup.children.length) {
+        const c = contourGroup.children[0];
+        contourGroup.remove(c);
+        if (c.geometry) c.geometry.dispose();
+    }
+
+    const halfWorld = TR_WORLD_SIZE / 2;
+    const sp = 0.08; // grid spacing for heatmap + contours
+    const yOff = 0.005;
+    const nx = Math.ceil(TR_WORLD_SIZE / sp) + 1;
+    const nz = nx;
+
+    // --- Pass 1: sample height and gradient magnitude on grid ---
+    const heights = new Float32Array(nx * nz);
+    const gradMag = new Float32Array(nx * nz);
+    let hMin = Infinity, hMax = -Infinity;
+    let gMax = 0;
+
+    for (let iz = 0; iz < nz; iz++) {
+        for (let ix = 0; ix < nx; ix++) {
+            const x = -halfWorld + ix * sp;
+            const z = -halfWorld + iz * sp;
+            const idx = iz * nx + ix;
+            const h = getTerrainHeight(x, z);
+            heights[idx] = h;
+            if (greenSignedDistance(x, z) < -0.1) {
+                if (h < hMin) hMin = h;
+                if (h > hMax) hMax = h;
+            }
+            const g = getGradientAt(x, z, angleDeg);
+            const m = Math.hypot(g.gx, g.gz);
+            gradMag[idx] = m;
+            if (m > gMax && greenSignedDistance(x, z) < -0.1) gMax = m;
+        }
+    }
+
+    // --- Pass 2: heatmap mesh (vertex-colored quads) ---
+    const heatPos = [];
+    const heatCol = [];
+    const heatIdx = [];
+    let heatVert = 0;
+
+    for (let iz = 0; iz < nz - 1; iz++) {
+        for (let ix = 0; ix < nx - 1; ix++) {
+            const x0 = -halfWorld + ix * sp;
+            const z0 = -halfWorld + iz * sp;
+            const cx = x0 + sp * 0.5, cz = z0 + sp * 0.5;
+            if (greenSignedDistance(cx, cz) > -0.1) continue;
+            if (Math.hypot(cx, cz) < HOLE_RADIUS_M + 0.02) continue;
+
+            // 4 corners: (ix,iz), (ix+1,iz), (ix,iz+1), (ix+1,iz+1)
+            const corners = [
+                [ix, iz], [ix + 1, iz], [ix, iz + 1], [ix + 1, iz + 1]
+            ];
+            const base = heatVert;
+            for (const [ci, cj] of corners) {
+                const px = -halfWorld + ci * sp;
+                const pz = -halfWorld + cj * sp;
+                const idx = cj * nx + ci;
+                heatPos.push(px, heights[idx] + yOff, pz);
+                // Color: blue (low gradient) → red (high gradient)
+                const t = gMax > 0.001 ? Math.min(gradMag[idx] / gMax, 1.0) : 0;
+                heatCol.push(
+                    0.2 + t * 0.7,      // R: 0.2 → 0.9
+                    0.3 - t * 0.1,      // G: 0.3 → 0.2
+                    0.9 - t * 0.8       // B: 0.9 → 0.1
+                );
+                heatVert++;
+            }
+            heatIdx.push(base, base + 1, base + 3);
+            heatIdx.push(base, base + 3, base + 2);
+        }
+    }
+
+    if (heatPos.length > 0) {
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(heatPos, 3));
+        geo.setAttribute('color', new THREE.Float32BufferAttribute(heatCol, 3));
+        geo.setIndex(heatIdx);
+        const mat = new THREE.MeshBasicMaterial({
+            vertexColors: true, transparent: true, opacity: 0.35,
+            depthTest: false, side: THREE.DoubleSide
+        });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.renderOrder = 993;
+        contourGroup.add(mesh);
+    }
+
+    // --- Pass 3: iso contour lines via marching squares ---
+    const hRange = hMax - hMin;
+    if (hRange < 1e-6) return;
+    const nLevels = 12;
+    const contourPos = [];
+
+    for (let li = 1; li < nLevels; li++) {
+        const level = hMin + (hRange * li) / nLevels;
+
+        for (let iz = 0; iz < nz - 1; iz++) {
+            for (let ix = 0; ix < nx - 1; ix++) {
+                const cx = -halfWorld + (ix + 0.5) * sp;
+                const cz = -halfWorld + (iz + 0.5) * sp;
+                if (greenSignedDistance(cx, cz) > -0.1) continue;
+
+                // 4 corner values (clockwise: TL, TR, BR, BL)
+                const i00 = iz * nx + ix;        // top-left
+                const i10 = iz * nx + ix + 1;    // top-right
+                const i11 = (iz + 1) * nx + ix + 1; // bottom-right
+                const i01 = (iz + 1) * nx + ix;  // bottom-left
+                const v0 = heights[i00], v1 = heights[i10];
+                const v2 = heights[i11], v3 = heights[i01];
+
+                // Classify corners (1 = above level)
+                const c0 = v0 >= level ? 1 : 0;
+                const c1 = v1 >= level ? 1 : 0;
+                const c2 = v2 >= level ? 1 : 0;
+                const c3 = v3 >= level ? 1 : 0;
+                const caseIdx = c0 | (c1 << 1) | (c2 << 2) | (c3 << 3);
+                if (caseIdx === 0 || caseIdx === 15) continue;
+
+                // Interpolation on edges
+                const x0 = -halfWorld + ix * sp;
+                const z0 = -halfWorld + iz * sp;
+                const x1 = x0 + sp;
+                const z1 = z0 + sp;
+
+                function lerp(va, vb, pa, pb) {
+                    const t = (level - va) / (vb - va);
+                    return [pa[0] + t * (pb[0] - pa[0]), pa[1] + t * (pb[1] - pa[1])];
+                }
+
+                // Edges: top(0-1), right(1-2), bottom(2-3), left(3-0)
+                const eTop = (c0 !== c1) ? lerp(v0, v1, [x0, z0], [x1, z0]) : null;
+                const eRight = (c1 !== c2) ? lerp(v1, v2, [x1, z0], [x1, z1]) : null;
+                const eBot = (c2 !== c3) ? lerp(v2, v3, [x1, z1], [x0, z1]) : null;
+                const eLeft = (c3 !== c0) ? lerp(v3, v0, [x0, z1], [x0, z0]) : null;
+
+                // Marching squares edge table
+                const edges = [];
+                switch (caseIdx) {
+                    case 1: case 14: edges.push(eTop, eLeft); break;
+                    case 2: case 13: edges.push(eTop, eRight); break;
+                    case 3: case 12: edges.push(eLeft, eRight); break;
+                    case 4: case 11: edges.push(eRight, eBot); break;
+                    case 5: edges.push(eTop, eRight, eBot, eLeft); break;
+                    case 6: case 9:  edges.push(eTop, eBot); break;
+                    case 7: case 8:  edges.push(eLeft, eBot); break;
+                    case 10: edges.push(eTop, eLeft, eRight, eBot); break;
+                }
+
+                // Emit line segments (pairs of points)
+                for (let ei = 0; ei < edges.length; ei += 2) {
+                    const a = edges[ei], b = edges[ei + 1];
+                    if (!a || !b) continue;
+                    const ha = getTerrainHeight(a[0], a[1]);
+                    const hb = getTerrainHeight(b[0], b[1]);
+                    contourPos.push(a[0], ha + yOff + 0.001, a[1]);
+                    contourPos.push(b[0], hb + yOff + 0.001, b[1]);
+                }
+            }
+        }
+    }
+
+    if (contourPos.length > 0) {
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(contourPos, 3));
+        const mat = new THREE.LineBasicMaterial({
+            color: 0xffffff, transparent: true, opacity: 0.5, depthTest: false
+        });
+        const lines = new THREE.LineSegments(geo, mat);
+        lines.renderOrder = 994;
+        contourGroup.add(lines);
+    }
+}
+
 function buildGradientArrows() {
     while (gradientGroup.children.length) {
         const c = gradientGroup.children[0];
@@ -1478,6 +1670,23 @@ rebuildScaleBar();
 const statsEl = document.getElementById('stats');
 const helpEl = document.getElementById('help');
 const messageEl = document.getElementById('message');
+const guideEl = document.getElementById('guide');
+let guideTimer = null;
+
+function setGuide(text, duration) {
+    if (gameState) { guideEl.classList.remove('show'); return; }
+    if (!text) { guideEl.classList.remove('show'); return; }
+    guideEl.textContent = text;
+    guideEl.classList.add('show');
+    if (guideTimer) clearTimeout(guideTimer);
+    if (duration) {
+        guideTimer = setTimeout(() => { guideEl.classList.remove('show'); }, duration);
+    } else {
+        guideTimer = null;
+    }
+}
+
+function clearGuide() { guideEl.classList.remove('show'); if (guideTimer) { clearTimeout(guideTimer); guideTimer = null; } }
 
 function updateHUD() {
     const lines = [
@@ -1511,6 +1720,105 @@ function updateHUD() {
     helpEl.style.display = showHelp ? '' : 'none';
     if (messageEl) messageEl.style.display = inHole ? '' : 'none';
     syncSlidersFromState();
+}
+
+// ===================================================================
+// SPEED CHART
+// ===================================================================
+const speedCanvas = document.getElementById('speed-chart');
+const speedCtx = speedCanvas.getContext('2d');
+
+function drawSpeedChart() {
+    if (!showSpeedChart) return;
+    const W = speedCanvas.width, H = speedCanvas.height;
+    const pad = { l: 45, r: 15, t: 30, b: 30 };
+    const cw = W - pad.l - pad.r, ch = H - pad.t - pad.b;
+
+    speedCtx.clearRect(0, 0, W, H);
+
+    // Background
+    speedCtx.fillStyle = 'rgba(10, 12, 16, 0.75)';
+    speedCtx.fillRect(0, 0, W, H);
+
+    if (speedData.length < 4) return; // need at least 2 points (pairs of dist,speed)
+
+    // Find ranges
+    let maxDist = 0, maxSpeed = 0;
+    for (let i = 0; i < speedData.length; i += 2) {
+        if (speedData[i] > maxDist) maxDist = speedData[i];
+        if (speedData[i + 1] > maxSpeed) maxSpeed = speedData[i + 1];
+    }
+    if (maxDist < 0.01) maxDist = 1;
+    if (maxSpeed < 0.01) maxSpeed = 1;
+    // Round up for nice axis
+    maxDist = Math.ceil(maxDist * 2) / 2;
+    maxSpeed = Math.ceil(maxSpeed * 4) / 4;
+
+    // Grid lines
+    speedCtx.strokeStyle = 'rgba(255,255,255,0.1)';
+    speedCtx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = pad.t + ch - (i / 4) * ch;
+        speedCtx.beginPath();
+        speedCtx.moveTo(pad.l, y);
+        speedCtx.lineTo(pad.l + cw, y);
+        speedCtx.stroke();
+    }
+    for (let i = 0; i <= 4; i++) {
+        const x = pad.l + (i / 4) * cw;
+        speedCtx.beginPath();
+        speedCtx.moveTo(x, pad.t);
+        speedCtx.lineTo(x, pad.t + ch);
+        speedCtx.stroke();
+    }
+
+    // Axes
+    speedCtx.strokeStyle = 'rgba(255,255,255,0.4)';
+    speedCtx.lineWidth = 1;
+    speedCtx.beginPath();
+    speedCtx.moveTo(pad.l, pad.t);
+    speedCtx.lineTo(pad.l, pad.t + ch);
+    speedCtx.lineTo(pad.l + cw, pad.t + ch);
+    speedCtx.stroke();
+
+    // Labels
+    speedCtx.fillStyle = 'rgba(255,255,255,0.6)';
+    speedCtx.font = '15px Courier New';
+    speedCtx.textAlign = 'center';
+    for (let i = 0; i <= 4; i++) {
+        const x = pad.l + (i / 4) * cw;
+        speedCtx.fillText((maxDist * i / 4).toFixed(1), x, pad.t + ch + 14);
+    }
+    speedCtx.fillText('(m)', pad.l + cw / 2, pad.t + ch + 26);
+    speedCtx.textAlign = 'right';
+    for (let i = 0; i <= 4; i++) {
+        const y = pad.t + ch - (i / 4) * ch;
+        speedCtx.fillText((maxSpeed * i / 4).toFixed(1), pad.l - 5, y + 5);
+    }
+    speedCtx.save();
+    speedCtx.translate(12, pad.t + ch / 2);
+    speedCtx.rotate(-Math.PI / 2);
+    speedCtx.textAlign = 'center';
+    speedCtx.fillText('(m/s)', 0, 0);
+    speedCtx.restore();
+
+    // Curve
+    speedCtx.strokeStyle = '#ffe033';
+    speedCtx.lineWidth = 2;
+    speedCtx.beginPath();
+    for (let i = 0; i < speedData.length; i += 2) {
+        const x = pad.l + (speedData[i] / maxDist) * cw;
+        const y = pad.t + ch - (speedData[i + 1] / maxSpeed) * ch;
+        if (i === 0) speedCtx.moveTo(x, y);
+        else speedCtx.lineTo(x, y);
+    }
+    speedCtx.stroke();
+}
+
+function toggleSpeedChart() {
+    showSpeedChart = !showSpeedChart;
+    speedCanvas.style.display = showSpeedChart ? 'block' : 'none';
+    if (!showSpeedChart) speedCtx.clearRect(0, 0, speedCanvas.width, speedCanvas.height);
 }
 
 // ===================================================================
@@ -1629,6 +1937,7 @@ renderer.domElement.addEventListener('mouseup', (e) => {
                 aimDot.material.color.setHex(0xe61a1a); // red — new active aimpoint
                 clearHint();
                 showAimPopup(e.clientX, e.clientY);
+                setGuide(GUIDE.SHOOT, 3000);
             }
         }
     }
@@ -1642,13 +1951,15 @@ renderer.domElement.addEventListener('wheel', () => {
 // SHARED ACTION HELPERS
 // ===================================================================
 function cycleFlowMode() {
-    flowMode = (flowMode + 1) % 4;
+    flowMode = (flowMode + 1) % 5;
     flowGroup.visible = flowMode === 1;
     gridFlowGroup.visible = flowMode === 2;
     gradientGroup.visible = flowMode === 3;
+    contourGroup.visible = flowMode === 4;
     if (flowMode === 1 && flowStreamlines.length === 0) rebuildFlowVisuals();
     if (flowMode === 2 && gridFlowParticles.length === 0) rebuildGridFlow();
     if (flowMode === 3) { gradientDirty = false; buildGradientArrows(); }
+    if (flowMode === 4 && contourGroup.children.length === 0) buildContourVis();
 }
 
 function resetCamera() {
@@ -1765,6 +2076,7 @@ document.getElementById('action-btns').addEventListener('click', (e) => {
         case 'newTerrain':  resetBall(true); break;
         case 'cycleFlow':   cycleFlowMode(); break;
         case 'resetCam':    resetCamera(); break;
+        case 'toggleSpeed': toggleSpeedChart(); break;
         case 'startGame':   startGame(); break;
     }
 });
@@ -1857,6 +2169,7 @@ renderer.domElement.addEventListener('touchend', (e) => {
                 aimDot.material.color.setHex(0xe61a1a); // red — new active aimpoint
                 clearHint();
                 showAimPopup(t.clientX, t.clientY);
+                setGuide(GUIDE.SHOOT, 3000);
             }
         }
     }
@@ -1893,6 +2206,7 @@ function startGame() {
     gameScore = 0;
     gameHoleScores = [];
     // Hide free-play UI (keep stats visible)
+    clearGuide();
     helpEl.style.display = 'none';
     sliderPanel.classList.add('collapsed');
     sliderPanel.style.display = 'none';
@@ -1946,6 +2260,7 @@ function setupHole(index) {
     flowGroup.visible = false;
     gridFlowGroup.visible = false;
     gradientGroup.visible = false;
+    contourGroup.visible = false;
     goodAimGroup.visible = false;
 
     // Reset camera
@@ -2076,6 +2391,9 @@ function shoot() {
     // Mark aimDot yellow — previous shot aimpoint
     aimDot.material.color.setHex(0xf0d259);
     clearHint();
+    clearGuide();
+    speedData = [];
+    speedSampleCounter = 0;
 
     lastShotStartPos = { x: ballPos[0], z: ballPos[2] };
 
@@ -2152,6 +2470,7 @@ function resetBall(newTerrain) {
         greenMesh = buildGreenMesh();
         worldGroup.add(greenMesh);
         if (flowMode === 3) buildGradientArrows();
+        if (flowMode === 4) buildContourVis();
         if (flowMode === 1) rebuildFlowVisuals();
         if (flowMode === 2) rebuildGridFlow();
         rebuildSlopeIndicator();
@@ -2159,6 +2478,7 @@ function resetBall(newTerrain) {
         startNewTrailSegment();
     }
     rebuildBreakMarkers();
+    if (!gameState) setGuide(GUIDE.AIM);
 }
 
 function updateBallOnCircle() {
@@ -2286,6 +2606,15 @@ function updatePhysics(dt) {
     const distMoved = Math.hypot(newX - ballPos[0], newZ - ballPos[2]);
     travelDist += distMoved;
 
+    // Record speed data for chart
+    if (showSpeedChart) {
+        speedSampleCounter++;
+        if (speedSampleCounter % 3 === 0) {
+            const spd = Math.hypot(ballVel[0], ballVel[2]);
+            speedData.push(travelDist, spd);
+        }
+    }
+
     // Ball rotation (quaternion)
     if (distMoved > 1e-6) {
         const mx = newX - ballPos[0], mz = newZ - ballPos[2];
@@ -2365,6 +2694,7 @@ function updatePhysics(dt) {
 
             // Game mode scoring on hole-in (only if valid)
             if (gameState === 'moving') scoreShot(!validHoleIn);
+            else setGuide(GUIDE.IN_HOLE);
         } else if (distToHole <= HOLE_RADIUS_M) {
             // Lip-out
             ballVel[0] *= 0.92;
@@ -2376,6 +2706,7 @@ function updatePhysics(dt) {
         colorLastAimPoint(false);
         // Game mode scoring on miss/near
         if (gameState === 'moving') scoreShot(false);
+        else setGuide(GUIDE.AIM);
     } else {
         // Don't trace trail inside the hole
         const dTrail = Math.hypot(ballPos[0], ballPos[2]);
@@ -2542,6 +2873,7 @@ function animate() {
 
     // ---- HUD ----
     updateHUD();
+    drawSpeedChart();
 
     // ---- Update green shader uniforms ----
     if (greenMaterial) {
@@ -2555,4 +2887,5 @@ function animate() {
 }
 
 animate();
+setGuide(GUIDE.WELCOME);
 console.log('Putting Simulator - Phase 3 loaded');
