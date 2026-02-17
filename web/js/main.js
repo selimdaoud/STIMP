@@ -306,6 +306,16 @@ let showHelp = false;
 let showSpeedChart = false;
 let speedData = [];
 let speedSampleCounter = 0;
+let speedAtHole = null;
+let maxLateralDev = 0;
+let breakApexPct = 0;
+let breakApexTravelDist = 0;
+let lineErrorAtHole = null;
+let entryAngle = null;
+let initialSpeed = null;
+let metricsShotStart = null;
+let closestHoleDist = Infinity;
+let prevHoleDist = Infinity;
 let flowMode = 0; // 0=off, 1=streamlines, 2=grid, 3=break arrows
 
 // Aim
@@ -1822,6 +1832,81 @@ function toggleSpeedChart() {
 }
 
 // ===================================================================
+// METRICS PANEL
+// ===================================================================
+const metricsPanel = document.getElementById('metrics-panel');
+const mToHole = document.getElementById('m-to-hole');
+const mInitSpeed = document.getElementById('m-init-speed');
+const mSpeedHole = document.getElementById('m-speed-hole');
+const mFinalDist = document.getElementById('m-final-dist');
+const mMaxBreak = document.getElementById('m-max-break');
+const mBreakApex = document.getElementById('m-break-apex');
+const mLineError = document.getElementById('m-line-error');
+const mEntryAngle = document.getElementById('m-entry-angle');
+
+document.getElementById('metrics-toggle').addEventListener('click', () => {
+    metricsPanel.classList.toggle('collapsed');
+});
+
+function updateMetrics() {
+    if (metricsPanel.classList.contains('collapsed')) return;
+    const dh = Math.hypot(ballPos[0], ballPos[2]);
+    mToHole.textContent = dh.toFixed(2) + ' m';
+
+    // Initial speed
+    if (initialSpeed !== null) {
+        mInitSpeed.textContent = initialSpeed.toFixed(2) + ' m/s';
+    }
+
+    // Speed at hole
+    if (speedAtHole !== null) {
+        mSpeedHole.textContent = speedAtHole.toFixed(2) + ' m/s';
+    } else if (ballMoving) {
+        mSpeedHole.textContent = '...';
+    }
+
+    // Final distance to hole (updated when stopped)
+    if (!ballMoving && travelDist > 0.01) {
+        mFinalDist.textContent = dh.toFixed(2) + ' m';
+    } else if (ballMoving) {
+        mFinalDist.textContent = '...';
+    }
+
+    // Max break
+    if (maxLateralDev > 0.001) {
+        const ballDiam = 2 * BALL_RADIUS_M;
+        const nBalls = maxLateralDev / ballDiam;
+        mMaxBreak.textContent = nBalls.toFixed(1) + ' balls (' + (maxLateralDev * 100).toFixed(1) + ' cm)';
+    } else if (ballMoving) {
+        mMaxBreak.textContent = '...';
+    }
+
+    // Break apex (% of total travel)
+    if (breakApexTravelDist > 0 && travelDist > 0.01) {
+        const pct = (breakApexTravelDist / travelDist) * 100;
+        mBreakApex.textContent = pct.toFixed(0) + '% (' + breakApexTravelDist.toFixed(2) + ' m)';
+    } else if (ballMoving) {
+        mBreakApex.textContent = '...';
+    }
+
+    // Line error at hole
+    if (lineErrorAtHole !== null) {
+        const ballDiam = 2 * BALL_RADIUS_M;
+        const nBalls = lineErrorAtHole / ballDiam;
+        mLineError.textContent = nBalls.toFixed(1) + ' balls (' + (lineErrorAtHole * 100).toFixed(1) + ' cm)';
+    } else if (ballMoving) {
+        mLineError.textContent = '...';
+    }
+
+    // Entry angle
+    if (entryAngle !== null) {
+        mEntryAngle.textContent = entryAngle.toFixed(1) + '°';
+    } else if (ballMoving) {
+        mEntryAngle.textContent = '...';
+    }
+}
+
+// ===================================================================
 // INPUT
 // ===================================================================
 const keysHeld = {};
@@ -2394,6 +2479,16 @@ function shoot() {
     clearGuide();
     speedData = [];
     speedSampleCounter = 0;
+    speedAtHole = null;
+    maxLateralDev = 0;
+    breakApexPct = 0;
+    breakApexTravelDist = 0;
+    lineErrorAtHole = null;
+    entryAngle = null;
+    initialSpeed = null;
+    metricsShotStart = { x: ballPos[0], z: ballPos[2] };
+    closestHoleDist = Infinity;
+    prevHoleDist = Infinity;
 
     lastShotStartPos = { x: ballPos[0], z: ballPos[2] };
 
@@ -2405,6 +2500,7 @@ function shoot() {
     ballVel[0] = speedH * dxn;
     ballVel[1] = totalSpeed * Math.sin(launchRad);
     ballVel[2] = speedH * dzn;
+    initialSpeed = speedH;
 
     ballMoving = true;
     ballOnCircle = false;
@@ -2612,6 +2708,51 @@ function updatePhysics(dt) {
         if (speedSampleCounter % 3 === 0) {
             const spd = Math.hypot(ballVel[0], ballVel[2]);
             speedData.push(travelDist, spd);
+        }
+    }
+
+    // Metrics: speed at hole passage + lateral deviation + entry angle + line error
+    if (metricsShotStart) {
+        const dh = Math.hypot(newX, newZ);
+        const curSpeed = Math.hypot(ballVel[0], ballVel[2]);
+
+        // Speed + line error + entry angle at closest approach to hole
+        if (dh < closestHoleDist) {
+            closestHoleDist = dh;
+        } else if (prevHoleDist <= closestHoleDist + 0.005 && speedAtHole === null) {
+            // Ball just started moving away from hole → record metrics at passage
+            speedAtHole = curSpeed;
+
+            // Line error: perpendicular distance from hole to trajectory at passage point
+            const sx = metricsShotStart.x, sz = metricsShotStart.z;
+            const lx = -sx, lz = -sz;
+            const ll = Math.hypot(lx, lz);
+            if (ll > 0.01) {
+                lineErrorAtHole = Math.abs(newX * lz - newZ * lx) / ll;
+            }
+
+            // Entry angle: angle between ball velocity and line ball→hole
+            if (curSpeed > 0.01) {
+                const toHoleX = -newX, toHoleZ = -newZ;
+                const toHoleLen = Math.hypot(toHoleX, toHoleZ);
+                if (toHoleLen > 0.001) {
+                    const dot = (ballVel[0] * toHoleX + ballVel[2] * toHoleZ) / (curSpeed * toHoleLen);
+                    entryAngle = Math.acos(Math.min(1, Math.abs(dot))) * 180 / Math.PI;
+                }
+            }
+        }
+        prevHoleDist = dh;
+
+        // Lateral deviation from start→hole line + break apex tracking
+        const sx = metricsShotStart.x, sz = metricsShotStart.z;
+        const lx = -sx, lz = -sz;
+        const lineLen = Math.hypot(lx, lz);
+        if (lineLen > 0.01) {
+            const cross = Math.abs((newX - sx) * lz - (newZ - sz) * lx) / lineLen;
+            if (cross > maxLateralDev) {
+                maxLateralDev = cross;
+                breakApexTravelDist = travelDist;
+            }
         }
     }
 
@@ -2874,6 +3015,7 @@ function animate() {
     // ---- HUD ----
     updateHUD();
     drawSpeedChart();
+    updateMetrics();
 
     // ---- Update green shader uniforms ----
     if (greenMaterial) {
