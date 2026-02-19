@@ -9,8 +9,7 @@ import { greenSignedDistance, generateShapeSeeds, getShapeSeeds, greenBoundingRa
 import { createGreenMaterial } from './greenShader.js';
 
 // ---- Constants (match Python) ----
-const GREEN_COLOR = new THREE.Color(0.08, 0.55, 0.24);
-const BG_COLOR = new THREE.Color(0.08, 0.09, 0.11);
+const BG_COLOR = new THREE.Color(0.0, 0.0, 0.015);
 const BALL_RADIUS_M = 0.0215;
 const HOLE_RADIUS_M = 2.0 * BALL_RADIUS_M;
 const CAMERA_HEIGHT = 5.0;
@@ -26,7 +25,7 @@ const BOUNCE_FRICTION = 0.8;
 const MIN_BOUNCE_VEL = 0.05;
 const LANDING_THRESHOLD = 0.001;
 const STIMP_DEFAULT = 3.0;
-const MAX_GHOST_DIST = 0.40;  // max ghost rest distance from hole for valid hole-in (meters)
+const MAX_GHOST_DIST = 0.50;  // max ghost rest distance from hole for valid hole-in (meters)
 const ANGLE_STEP_DEG = 0.1;
 const ANGLE_MAX_DEG = 5.0;
 const LAUNCH_ANGLE_DEFAULT = 5;
@@ -58,8 +57,8 @@ function stimpToMu(s) {
 function getGradientAt(x, z, curAngleDeg) {
     const globalSlopeZ = GRAVITY * Math.sin(curAngleDeg * Math.PI / 180) * ROLLING_FACTOR;
     const normal = getTerrainNormal(x, z);
-    let gx = -normal.x * GRAVITY * ROLLING_FACTOR;
-    let gz = -normal.z * GRAVITY * ROLLING_FACTOR + globalSlopeZ;
+    let gx = normal.x * GRAVITY * ROLLING_FACTOR;
+    let gz = normal.z * GRAVITY * ROLLING_FACTOR + globalSlopeZ;
     const tr = trueRollAccel(x, z, 0.3, 0.0);
     gx += tr.ax;
     gz += tr.az;
@@ -71,7 +70,7 @@ const scene = new THREE.Scene();
 scene.background = BG_COLOR;
 
 const camera = new THREE.PerspectiveCamera(
-    ZOOM_DEFAULT, window.innerWidth / window.innerHeight, 0.01, 100
+    ZOOM_DEFAULT, window.innerWidth / window.innerHeight, 0.01, 1200
 );
 camera.position.set(0, CAMERA_HEIGHT, 0.01);
 camera.lookAt(0, 0, 0);
@@ -179,13 +178,12 @@ function buildHole() {
     const holeMargin = HOLE_RADIUS_M + 0.02;
     const collarOuter = holeMargin + 0.3;
 
-    // Green collar
+    // Green collar — same shader as the green surface
     {
         const geo = new THREE.RingGeometry(outerRim, collarOuter, segments);
         geo.rotateX(-Math.PI / 2);
         geo.translate(0, 0.001, 0);
-        const mat = new THREE.MeshBasicMaterial({ color: GREEN_COLOR, side: THREE.DoubleSide });
-        group.add(new THREE.Mesh(geo, mat));
+        group.add(new THREE.Mesh(geo, greenMaterial));
     }
     // Cylinder walls
     {
@@ -306,9 +304,12 @@ let showHelp = false;
 let showSpeedChart = false;
 let speedData = [];
 let speedSampleCounter = 0;
+let showEnergyChart = false;
+let energyData = [];
+let launchV0sq = null;
+let launchMu = null;
 let speedAtHole = null;
 let maxLateralDev = 0;
-let breakApexPct = 0;
 let breakApexTravelDist = 0;
 let lineErrorAtHole = null;
 let entryAngle = null;
@@ -338,15 +339,15 @@ let gameHoleScores = []; // per-hole scores
 const GAME_OOB_DIST = 6.0; // ball too far from hole = lost
 
 const GAME_HOLES = [
-    { slope: 1.0, stimp: 3.0, trueRoll: 0.0, distance: 2.0, seed: 1001 },
-    { slope: 1.5, stimp: 3.0, trueRoll: 0.5, distance: 2.5, seed: 1002 },
-    { slope: 2.0, stimp: 3.5, trueRoll: 0.5, distance: 3.0, seed: 1003 },
-    { slope: 2.5, stimp: 3.5, trueRoll: 1.0, distance: 3.0, seed: 1004 },
-    { slope: 3.0, stimp: 3.5, trueRoll: 1.0, distance: 3.5, seed: 1005 },
-    { slope: 3.0, stimp: 3.5, trueRoll: 1.5, distance: 3.5, seed: 1006 },
-    { slope: 3.5, stimp: 3.5, trueRoll: 1.5, distance: 4.0, seed: 1007 },
-    { slope: 4.0, stimp: 3.5, trueRoll: 2.0, distance: 4.5, seed: 1008 },
-    { slope: 5.0, stimp: 3.5, trueRoll: 2.0, distance: 5.0, seed: 1009 },
+    { slope:  1.0, stimp: 3.0, trueRoll: 0.0, distance: 2.0, seed: 1001 },
+    { slope: -1.0, stimp: 3.0, trueRoll: 0.5, distance: 2.5, seed: 1002 },
+    { slope:  2.0, stimp: 3.5, trueRoll: 0.5, distance: 3.0, seed: 1003 },
+    { slope: -2.0, stimp: 3.5, trueRoll: 1.0, distance: 3.0, seed: 1004 },
+    { slope:  3.0, stimp: 3.5, trueRoll: 1.0, distance: 3.5, seed: 1005 },
+    { slope: -3.0, stimp: 3.5, trueRoll: 1.5, distance: 3.5, seed: 1006 },
+    { slope:  2.5, stimp: 3.5, trueRoll: 1.5, distance: 4.0, seed: 1007 },
+    { slope: -2.5, stimp: 3.5, trueRoll: 2.0, distance: 4.5, seed: 1008 },
+    { slope:  1.5, stimp: 3.5, trueRoll: 2.0, distance: 5.0, seed: 1009 },
 ];
 
 // ===================================================================
@@ -355,30 +356,53 @@ const GAME_HOLES = [
 const MAX_TRAIL_PTS = 5000;
 const trailGroup = new THREE.Group();
 worldGroup.add(trailGroup);
-const trailMat = new THREE.LineBasicMaterial({ color: 0xf5f5f5, depthTest: false });
+const trailMat = new THREE.LineBasicMaterial({
+    vertexColors: true, depthTest: false,
+    blending: THREE.AdditiveBlending, transparent: true,
+});
 
-// Each segment: { line, count, data }
+// Each segment: { line, count, data, colorData }
 let trailLines = [];
 let currentTrailLine = null;
 
+function trailSpeedColor(ratio) {
+    // ratio 0→1: ice-blue → cyan → yellow → red-orange  (boosted for visibility)
+    let r, g, b;
+    if (ratio > 0.7) {
+        const t = (ratio - 0.7) / 0.3;
+        r = 1.0; g = 0.35 + 0.65 * (1 - t); b = 0.0;  // yellow → hot red
+    } else if (ratio > 0.35) {
+        const t = (ratio - 0.35) / 0.35;
+        r = t * 1.0; g = 0.85; b = 1.0 - t * 0.9;      // cyan → yellow
+    } else {
+        const t = ratio / 0.35;
+        r = 0.1 + 0.3 * t; g = 0.7 + 0.2 * t; b = 1.0; // ice-blue → cyan
+    }
+    return [r, g, b];
+}
+
 function newTrailSegment() {
-    const data = new Float32Array(MAX_TRAIL_PTS * 3);
+    const data      = new Float32Array(MAX_TRAIL_PTS * 3);
+    const colorData = new Float32Array(MAX_TRAIL_PTS * 3);
     const geo = new THREE.BufferGeometry();
-    const attr = new THREE.BufferAttribute(data, 3);
-    attr.setUsage(THREE.DynamicDrawUsage);
-    geo.setAttribute('position', attr);
+    const posAttr = new THREE.BufferAttribute(data, 3);
+    posAttr.setUsage(THREE.DynamicDrawUsage);
+    const colAttr = new THREE.BufferAttribute(colorData, 3);
+    colAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('position', posAttr);
+    geo.setAttribute('color', colAttr);
     geo.setDrawRange(0, 0);
     const line = new THREE.Line(geo, trailMat);
     line.frustumCulled = false;
     line.renderOrder = 999;
     trailGroup.add(line);
-    const seg = { line, count: 0, data };
+    const seg = { line, count: 0, data, colorData };
     trailLines.push(seg);
     currentTrailLine = seg;
     return seg;
 }
 
-function addTrailPoint(x, y, z) {
+function addTrailPoint(x, y, z, speedRatio = 1.0) {
     if (!currentTrailLine) newTrailSegment();
     const seg = currentTrailLine;
     if (seg.count >= MAX_TRAIL_PTS) return;
@@ -389,8 +413,11 @@ function addTrailPoint(x, y, z) {
     }
     const i = seg.count * 3;
     seg.data[i] = x; seg.data[i + 1] = y; seg.data[i + 2] = z;
+    const [r, g, b] = trailSpeedColor(Math.min(1, Math.max(0, speedRatio)));
+    seg.colorData[i] = r; seg.colorData[i + 1] = g; seg.colorData[i + 2] = b;
     seg.count++;
     seg.line.geometry.attributes.position.needsUpdate = true;
+    seg.line.geometry.attributes.color.needsUpdate = true;
     seg.line.geometry.setDrawRange(0, seg.count);
 }
 
@@ -401,11 +428,264 @@ function clearAllTrails() {
     }
     trailLines = [];
     currentTrailLine = null;
+    clearTrailParticles();
 }
 
 function startNewTrailSegment() {
     currentTrailLine = null;
 }
+
+// ===================================================================
+// TRAIL PARTICLE SYSTEM
+// ===================================================================
+
+// Radial glow sprite texture (64×64 canvas)
+const _glowCanvas = document.createElement('canvas');
+_glowCanvas.width = _glowCanvas.height = 64;
+{
+    const ctx = _glowCanvas.getContext('2d');
+    const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0,    'rgba(255,255,255,1.0)');
+    g.addColorStop(0.15, 'rgba(255,255,255,0.9)');
+    g.addColorStop(0.45, 'rgba(255,255,255,0.3)');
+    g.addColorStop(1.0,  'rgba(255,255,255,0.0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 64, 64);
+}
+const glowTex = new THREE.CanvasTexture(_glowCanvas);
+
+const MAX_TP      = 900;
+const TP_LIFETIME = 52;   // frames ≈ 0.87 s at 60 fps
+
+const _tpPos    = new Float32Array(MAX_TP * 3);
+const _tpCol    = new Float32Array(MAX_TP * 3);
+const _tpBase   = new Float32Array(MAX_TP * 3);   // base colour at emission
+const _tpAge    = new Float32Array(MAX_TP).fill(1); // 1 = dead
+
+const _tpGeo = new THREE.BufferGeometry();
+const _tpPosAttr = new THREE.BufferAttribute(_tpPos, 3);
+_tpPosAttr.setUsage(THREE.DynamicDrawUsage);
+const _tpColAttr = new THREE.BufferAttribute(_tpCol, 3);
+_tpColAttr.setUsage(THREE.DynamicDrawUsage);
+_tpGeo.setAttribute('position', _tpPosAttr);
+_tpGeo.setAttribute('color',    _tpColAttr);
+_tpGeo.setDrawRange(0, MAX_TP);
+
+const _tpMesh = new THREE.Points(_tpGeo, new THREE.PointsMaterial({
+    size: 11,
+    sizeAttenuation: false,
+    vertexColors: true,
+    map: glowTex,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    alphaTest: 0.001,
+}));
+_tpMesh.frustumCulled = false;
+_tpMesh.renderOrder   = 998;
+worldGroup.add(_tpMesh);
+
+let _tpHead = 0;
+
+function emitTrailParticles(x, y, z, speedRatio) {
+    for (let n = 0; n < 3; n++) {
+        const i = _tpHead % MAX_TP;
+        _tpHead++;
+        // Slight positional jitter for volume
+        _tpPos[i*3]   = x + (Math.random() - 0.5) * 0.018;
+        _tpPos[i*3+1] = y + Math.random() * 0.012;
+        _tpPos[i*3+2] = z + (Math.random() - 0.5) * 0.018;
+        _tpAge[i] = 0;
+        const [r, g, b] = trailSpeedColor(Math.min(1, Math.max(0, speedRatio)));
+        _tpBase[i*3] = r; _tpBase[i*3+1] = g; _tpBase[i*3+2] = b;
+        _tpCol[i*3]  = r; _tpCol[i*3+1]  = g; _tpCol[i*3+2]  = b;
+    }
+    _tpPosAttr.needsUpdate = true;
+}
+
+function updateTrailParticles() {
+    const inv = 1.0 / TP_LIFETIME;
+    for (let i = 0; i < MAX_TP; i++) {
+        if (_tpAge[i] >= 1.0) {
+            _tpCol[i*3] = _tpCol[i*3+1] = _tpCol[i*3+2] = 0; // black = invisible
+            continue;
+        }
+        _tpAge[i] += inv;
+        const t = Math.max(0, 1 - _tpAge[i]);
+        const bright = t * t;   // quadratic fade
+        _tpCol[i*3]   = _tpBase[i*3]   * bright;
+        _tpCol[i*3+1] = _tpBase[i*3+1] * bright;
+        _tpCol[i*3+2] = _tpBase[i*3+2] * bright;
+    }
+    _tpColAttr.needsUpdate = true;
+}
+
+function clearTrailParticles() {
+    _tpAge.fill(1.0);
+    _tpCol.fill(0);
+    _tpColAttr.needsUpdate = true;
+}
+
+// ===================================================================
+// SPACE SKY
+// ===================================================================
+const SKY_R    = 500;
+const COMET_R  = 488;
+const MAX_STARS = 12000;
+
+let starCount  = 3000;
+let skyRotSpeed = 0.0003;
+
+const skyGroup = new THREE.Group();
+scene.add(skyGroup);
+
+// ---- Stars ----
+const starBaseCol  = new Float32Array(MAX_STARS * 3);
+const starColBuf   = new Float32Array(MAX_STARS * 3);
+const starTwkSpd   = new Float32Array(MAX_STARS);
+const starTwkPhs   = new Float32Array(MAX_STARS);
+const starPosBuf   = new Float32Array(MAX_STARS * 3);
+
+for (let i = 0; i < MAX_STARS; i++) {
+    const theta = Math.random() * Math.PI * 2;
+    const phi   = Math.acos(2 * Math.random() - 1);
+    const r     = SKY_R * (0.88 + Math.random() * 0.12);
+    starPosBuf[i*3]   = r * Math.sin(phi) * Math.cos(theta);
+    starPosBuf[i*3+1] = r * Math.cos(phi);
+    starPosBuf[i*3+2] = r * Math.sin(phi) * Math.sin(theta);
+    const bright = 0.45 + Math.random() * 0.55;
+    const warm   = Math.random() < 0.16;
+    const cold   = !warm && Math.random() < 0.2;
+    if (warm) {
+        starBaseCol[i*3] = bright; starBaseCol[i*3+1] = bright*0.65; starBaseCol[i*3+2] = bright*0.25;
+    } else if (cold) {
+        starBaseCol[i*3] = bright*0.55; starBaseCol[i*3+1] = bright*0.75; starBaseCol[i*3+2] = bright;
+    } else {
+        starBaseCol[i*3] = bright*0.82; starBaseCol[i*3+1] = bright*0.88; starBaseCol[i*3+2] = bright;
+    }
+    starColBuf[i*3] = starBaseCol[i*3]; starColBuf[i*3+1] = starBaseCol[i*3+1]; starColBuf[i*3+2] = starBaseCol[i*3+2];
+    starTwkSpd[i] = 0.4 + Math.random() * 3.0;
+    starTwkPhs[i] = Math.random() * Math.PI * 2;
+}
+
+const starsGeo = new THREE.BufferGeometry();
+starsGeo.setAttribute('position', new THREE.BufferAttribute(starPosBuf, 3));
+const starsColAttr = new THREE.BufferAttribute(starColBuf, 3);
+starsColAttr.setUsage(THREE.DynamicDrawUsage);
+starsGeo.setAttribute('color', starsColAttr);
+starsGeo.setDrawRange(0, starCount);
+const starsMat = new THREE.PointsMaterial({ size: 1.6, vertexColors: true, sizeAttenuation: false, depthWrite: false });
+const starsPoints = new THREE.Points(starsGeo, starsMat);
+skyGroup.add(starsPoints);
+
+// ---- Galaxy band (tilted 35°) ----
+const N_GAL  = 4000;
+const gPosBuf = new Float32Array(N_GAL * 3);
+const gColBuf = new Float32Array(N_GAL * 3);
+{
+    const tilt = 35 * Math.PI / 180;
+    const cosT = Math.cos(tilt), sinT = Math.sin(tilt);
+    for (let i = 0; i < N_GAL; i++) {
+        const theta  = Math.random() * Math.PI * 2;
+        const spread = (Math.random() + Math.random() - 1) * 0.20;
+        const phi    = Math.PI / 2 + spread;
+        const r      = SKY_R * 0.93;
+        const x0 = r * Math.sin(phi) * Math.cos(theta);
+        const y0 = r * Math.cos(phi);
+        const z0 = r * Math.sin(phi) * Math.sin(theta);
+        gPosBuf[i*3]   = x0;
+        gPosBuf[i*3+1] = y0 * cosT - z0 * sinT;
+        gPosBuf[i*3+2] = y0 * sinT + z0 * cosT;
+        const t = Math.random();
+        gColBuf[i*3]   = 0.40 + t * 0.55;
+        gColBuf[i*3+1] = 0.10 + t * 0.30;
+        gColBuf[i*3+2] = 0.65 + t * 0.35;
+    }
+}
+const galGeo = new THREE.BufferGeometry();
+galGeo.setAttribute('position', new THREE.BufferAttribute(gPosBuf, 3));
+galGeo.setAttribute('color',    new THREE.BufferAttribute(gColBuf, 3));
+skyGroup.add(new THREE.Points(galGeo,
+    new THREE.PointsMaterial({ size: 1.0, vertexColors: true, sizeAttenuation: false, depthWrite: false, transparent: true, opacity: 0.72 })));
+
+
+// ---- Comets ----
+function makeCometOrbitPlane() {
+    const u = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+    const tmp = Math.abs(u.x) < 0.8 ? new THREE.Vector3(1,0,0) : new THREE.Vector3(0,1,0);
+    const v = new THREE.Vector3().crossVectors(u, tmp).normalize();
+    const w = new THREE.Vector3().crossVectors(u, v).normalize();
+    return { u: v, v: w };
+}
+
+const comets = Array.from({ length: 7 }, (_, ci) => {
+    const tailLen = 50 + Math.floor(Math.random() * 50);
+    const count   = tailLen + 1;
+    const positions = new Float32Array(count * 3);
+    const colors    = new Float32Array(count * 3);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
+    geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3).setUsage(THREE.DynamicDrawUsage));
+    geo.setDrawRange(0, 0);
+    const pts = new THREE.Points(geo, new THREE.PointsMaterial({
+        size: 2.0 + Math.random() * 1.5,
+        vertexColors: true, sizeAttenuation: false, depthWrite: false, transparent: true,
+    }));
+    skyGroup.add(pts);
+    const { u, v } = makeCometOrbitPlane();
+    return {
+        pts, geo, positions, colors, u, v, tailLen, trail: [],
+        angle: (ci / 7) * Math.PI * 2 + Math.random() * 0.5,
+        speed: (0.003 + Math.random() * 0.007) * (Math.random() < 0.5 ? 1 : -1),
+        delay: ci * 90, frame: 0,
+    };
+});
+
+// ---- Sky update (called each frame) ----
+let skyTime = 0;
+function updateSky(dt) {
+    skyTime += dt;
+
+    // Slow sky rotation
+    skyGroup.rotation.y += skyRotSpeed;
+
+    // Twinkling: update all stars each frame with sine modulation
+    for (let i = 0; i < starCount; i++) {
+        const twinkle = 0.65 + 0.35 * Math.sin(skyTime * starTwkSpd[i] + starTwkPhs[i]);
+        starColBuf[i*3]   = starBaseCol[i*3]   * twinkle;
+        starColBuf[i*3+1] = starBaseCol[i*3+1] * twinkle;
+        starColBuf[i*3+2] = starBaseCol[i*3+2] * twinkle;
+    }
+    starsColAttr.needsUpdate = true;
+
+    // Comets
+    comets.forEach(c => {
+        c.frame++;
+        if (c.frame < c.delay) return;
+        c.angle += c.speed;
+        const cos = Math.cos(c.angle), sin = Math.sin(c.angle);
+        c.trail.push(
+            COMET_R * (cos * c.u.x + sin * c.v.x),
+            COMET_R * (cos * c.u.y + sin * c.v.y),
+            COMET_R * (cos * c.u.z + sin * c.v.z)
+        );
+        if (c.trail.length > c.tailLen * 3) c.trail.splice(0, 3);
+        const total = c.trail.length / 3;
+        for (let i = 0; i < total; i++) {
+            const src = (total - 1 - i) * 3, dst = i * 3;
+            c.positions[dst]   = c.trail[src];
+            c.positions[dst+1] = c.trail[src+1];
+            c.positions[dst+2] = c.trail[src+2];
+            const fade = Math.pow(1 - i / total, 1.6);
+            c.colors[dst] = fade; c.colors[dst+1] = fade * 0.92; c.colors[dst+2] = fade;
+        }
+        c.geo.attributes.position.needsUpdate = true;
+        c.geo.attributes.color.needsUpdate    = true;
+        c.geo.setDrawRange(0, total);
+    });
+}
+
+
 
 // ===================================================================
 // AIM LINE & DOT
@@ -451,7 +731,19 @@ function showAimPopup(screenX, screenY) {
     const nBalls = perpDist / ballDiam;
     const cm = perpDist * 100;
 
-    aimPopup.textContent = `${nBalls.toFixed(1)} balls (${cm.toFixed(1)} cm)`;
+    // Height of aim point relative to ball start, accounting for global slope tilt.
+    // worldGroup is rotated by angleDeg around X, so the world-Y of a local point (x, h, z)
+    // is  h·cos(θ) − z·sin(θ).  For the difference between two surface points:
+    //   ΔY = (hAim − hBall)·cos(θ) − (az − bz)·sin(θ)
+    const thetaRad = angleDeg * Math.PI / 180;
+    const hAim  = getTerrainHeight(ax, az);
+    const hBall = getTerrainHeight(bx, bz);
+    const dh = ((hAim - hBall) * Math.cos(thetaRad) - (az - bz) * Math.sin(thetaRad)) * 100;
+    const dhArrow = Math.abs(dh) < 0.05 ? '' : (dh > 0 ? '↑' : '↓');
+    const dhStr = dhArrow + (dh >= 0 ? '+' : '') + dh.toFixed(1) + ' cm';
+
+    const dhColor = Math.abs(dh) < 0.05 ? '#7ef0a0' : (dh > 0 ? '#7ef0a0' : '#f07e7e');
+    aimPopup.innerHTML = `${nBalls.toFixed(1)} balls (${cm.toFixed(1)} cm)<br><span style="color:${dhColor}">${dhStr} &nbsp;|&nbsp; ${lineLen.toFixed(2)} m</span>`;
     aimPopup.style.left = screenX + 'px';
     aimPopup.style.top = screenY + 'px';
     aimPopup.style.display = 'block';
@@ -459,6 +751,42 @@ function showAimPopup(screenX, screenY) {
     if (aimPopupTimer) clearTimeout(aimPopupTimer);
     aimPopupTimer = setTimeout(() => { aimPopup.style.display = 'none'; }, 2000);
 }
+
+// Shot info popup (shown at ball position on shoot, dismissed on next pointer/touch)
+const shotPopup = document.createElement('div');
+shotPopup.style.cssText = `
+    position: absolute; pointer-events: none; display: none;
+    background: rgba(0,0,0,0.80); border: 1px solid rgba(255,255,255,0.3);
+    color: #fff; padding: 6px 12px; border-radius: 4px;
+    font-family: 'Courier New', monospace; font-size: 12px;
+    white-space: nowrap; z-index: 30; transform: translate(-50%, calc(-100% - 14px));
+    line-height: 1.7;
+`;
+document.getElementById('hud').appendChild(shotPopup);
+
+function showShotPopup(totalSpeed, maxHeightCm, flightLenCm, angle, spin) {
+    const v = new THREE.Vector3(ballPos[0], ballPos[1], ballPos[2]);
+    worldGroup.updateMatrixWorld();
+    v.applyMatrix4(worldGroup.matrixWorld);
+    v.project(camera);
+    const sx = (v.x * 0.5 + 0.5) * window.innerWidth;
+    const sy = (-v.y * 0.5 + 0.5) * window.innerHeight;
+
+    const angleStr = (angle >= 0 ? '+' : '') + angle + '°';
+    const spinStr  = spin !== 0 ? spin.toFixed(2) : '0';
+    shotPopup.innerHTML =
+        `speed: <span style="color:#ffe033">${totalSpeed.toFixed(2)} m/s</span><br>` +
+        `height: <span style="color:#ffe033">${maxHeightCm.toFixed(1)} cm</span><br>` +
+        `flight: <span style="color:#ffe033">${flightLenCm.toFixed(1)} cm</span><br>` +
+        `angle: <span style="color:#ffe033">${angleStr}</span><br>` +
+        `spin: <span style="color:#ffe033">${spinStr}</span>`;
+    shotPopup.style.left = sx + 'px';
+    shotPopup.style.top  = sy + 'px';
+    shotPopup.style.display = 'block';
+}
+
+document.addEventListener('pointerdown', () => { shotPopup.style.display = 'none'; });
+document.addEventListener('touchstart',  () => { shotPopup.style.display = 'none'; }, { passive: true });
 
 // ===================================================================
 // SHOT AIM POINT MARKERS
@@ -545,7 +873,7 @@ function placeGhostCross(x, z) {
 }
 
 function simulateGhostRest(startPos, startVel, startSpin) {
-    // Continue ball physics ignoring the hole until ball stops
+    // Continue ball physics ignoring the hole until ball stops.
     const simDt = 1 / 120;
     let px = startPos[0], py = startPos[1], pz = startPos[2];
     let vx = startVel[0], vy = startVel[1], vz = startVel[2];
@@ -574,8 +902,8 @@ function simulateGhostRest(startPos, startVel, startSpin) {
                 spinMod = Math.max(0.5, Math.min(1.5, spinMod));
                 ax -= friction * spinMod * (vx / speed);
                 az -= friction * spinMod * (vz / speed);
-                ax += -normal.x * GRAVITY * ROLLING_FACTOR;
-                az += -normal.z * GRAVITY * ROLLING_FACTOR;
+                ax += normal.x * GRAVITY * ROLLING_FACTOR;
+                az += normal.z * GRAVITY * ROLLING_FACTOR;
             }
             spin *= Math.exp(-SPIN_DECAY_RATE * simDt);
             if (Math.abs(spin) < 0.01) spin = 0;
@@ -665,8 +993,8 @@ function simulateTrajectory(startPos, vel) {
                 spinMod = Math.max(0.5, Math.min(1.5, spinMod));
                 ax -= friction * spinMod * (vx / speed);
                 az -= friction * spinMod * (vz / speed);
-                ax += -normal.x * GRAVITY * ROLLING_FACTOR;
-                az += -normal.z * GRAVITY * ROLLING_FACTOR;
+                ax += normal.x * GRAVITY * ROLLING_FACTOR;
+                az += normal.z * GRAVITY * ROLLING_FACTOR;
             }
             spin *= Math.exp(-SPIN_DECAY_RATE * simDt);
             if (Math.abs(spin) < 0.01) spin = 0;
@@ -1344,7 +1672,7 @@ function rebuildFlowVisuals() {
     // uphill side will trace long paths; downhill seeds exit quickly and
     // get filtered out by the minimum-length check.
     const halfWorld = TR_WORLD_SIZE / 2;
-    const spacing = 0.21;
+    const spacing = 0.36;
     flowStreamlines = [];
 
     // Scan the full world grid and seed from points near the green edge
@@ -1832,6 +2160,250 @@ function toggleSpeedChart() {
 }
 
 // ===================================================================
+// ENERGY BUDGET CHART
+// ===================================================================
+const energyCanvas = document.getElementById('energy-chart');
+const energyCtx = energyCanvas.getContext('2d');
+
+function drawEnergyChart() {
+    if (!showEnergyChart) return;
+    const W = energyCanvas.width, H = energyCanvas.height;
+    energyCtx.clearRect(0, 0, W, H);
+
+    // Background
+    energyCtx.fillStyle = 'rgba(0,0,0,0.7)';
+    energyCtx.fillRect(0, 0, W, H);
+
+    const pad = { l: 42, r: 14, t: 20, b: 40 };
+    const cw = W - pad.l - pad.r;
+    const ch = H - pad.t - pad.b;
+
+    // Determine x range
+    let maxDist = 0.5;
+    for (let i = 0; i < energyData.length; i += 2) {
+        if (energyData[i] > maxDist) maxDist = energyData[i];
+    }
+    // If we have launch params, extend range to where flat reference hits 0
+    if (launchV0sq > 0 && launchMu !== null) {
+        const flatStop = launchV0sq / (2 * launchMu * GRAVITY);
+        if (flatStop > maxDist) maxDist = flatStop;
+    }
+
+    // Grid lines
+    energyCtx.strokeStyle = 'rgba(255,255,255,0.1)';
+    energyCtx.lineWidth = 1;
+    for (let g = 0; g <= 4; g++) {
+        const y = pad.t + (g / 4) * ch;
+        energyCtx.beginPath();
+        energyCtx.moveTo(pad.l, y);
+        energyCtx.lineTo(pad.l + cw, y);
+        energyCtx.stroke();
+    }
+
+    // Axes
+    energyCtx.strokeStyle = 'rgba(255,255,255,0.5)';
+    energyCtx.lineWidth = 1.5;
+    energyCtx.beginPath();
+    energyCtx.moveTo(pad.l, pad.t);
+    energyCtx.lineTo(pad.l, pad.t + ch);
+    energyCtx.lineTo(pad.l + cw, pad.t + ch);
+    energyCtx.stroke();
+
+    // Axis labels
+    energyCtx.fillStyle = '#ccc';
+    energyCtx.font = '15px monospace';
+    energyCtx.textAlign = 'right';
+    energyCtx.textBaseline = 'middle';
+    const yLabels = ['100%', '75%', '50%', '25%', '0%'];
+    for (let g = 0; g <= 4; g++) {
+        const y = pad.t + (g / 4) * ch;
+        energyCtx.fillText(yLabels[g], pad.l - 4, y);
+    }
+    // X axis ticks + labels
+    energyCtx.textAlign = 'center';
+    energyCtx.textBaseline = 'top';
+    energyCtx.strokeStyle = 'rgba(255,255,255,0.4)';
+    energyCtx.lineWidth = 1;
+    const xTicks = 5;
+    for (let t = 0; t <= xTicks; t++) {
+        const x = pad.l + (t / xTicks) * cw;
+        energyCtx.beginPath();
+        energyCtx.moveTo(x, pad.t + ch);
+        energyCtx.lineTo(x, pad.t + ch + 5);
+        energyCtx.stroke();
+        energyCtx.fillStyle = '#ccc';
+        energyCtx.fillText((maxDist * t / xTicks).toFixed(1), x, pad.t + ch + 7);
+    }
+    // X axis unit label
+    energyCtx.fillStyle = '#999';
+    energyCtx.fillText('(m)', pad.l + cw / 2, pad.t + ch + 20);
+
+    // Y axis label (rotated)
+    energyCtx.save();
+    energyCtx.translate(10, pad.t + ch / 2);
+    energyCtx.rotate(-Math.PI / 2);
+    energyCtx.textAlign = 'center';
+    energyCtx.textBaseline = 'middle';
+    energyCtx.fillText('KE %', 0, 0);
+    energyCtx.restore();
+
+    // Flat green reference curve (grey dotted)
+    if (launchV0sq > 0 && launchMu !== null) {
+        energyCtx.setLineDash([6, 4]);
+        energyCtx.strokeStyle = 'rgba(180,180,180,0.7)';
+        energyCtx.lineWidth = 1.5;
+        energyCtx.beginPath();
+        const steps = 80;
+        let started = false;
+        for (let s = 0; s <= steps; s++) {
+            const d = (s / steps) * maxDist;
+            const keFlat = Math.max(0, 1 - (2 * launchMu * GRAVITY * d) / launchV0sq);
+            const px = pad.l + (d / maxDist) * cw;
+            const py = pad.t + ch - keFlat * ch;
+            if (!started) { energyCtx.moveTo(px, py); started = true; }
+            else energyCtx.lineTo(px, py);
+            if (keFlat === 0) break;
+        }
+        energyCtx.stroke();
+        energyCtx.setLineDash([]);
+    }
+
+    // Actual KE curve (yellow fill + stroke)
+    if (energyData.length >= 4) {
+        // Build flat reference values at same x positions for fill
+        energyCtx.beginPath();
+        // Forward pass along actual curve
+        for (let i = 0; i < energyData.length; i += 2) {
+            const d = energyData[i];
+            const ke = energyData[i + 1];
+            const px = pad.l + (d / maxDist) * cw;
+            const py = pad.t + ch - ke * ch;
+            if (i === 0) energyCtx.moveTo(px, py);
+            else energyCtx.lineTo(px, py);
+        }
+        // Reverse pass along flat reference for fill
+        for (let i = energyData.length - 2; i >= 0; i -= 2) {
+            const d = energyData[i];
+            let keFlat = 1;
+            if (launchV0sq > 0 && launchMu !== null) {
+                keFlat = Math.max(0, 1 - (2 * launchMu * GRAVITY * d) / launchV0sq);
+            }
+            const px = pad.l + (d / maxDist) * cw;
+            const py = pad.t + ch - keFlat * ch;
+            energyCtx.lineTo(px, py);
+        }
+        energyCtx.closePath();
+        energyCtx.fillStyle = 'rgba(255, 200, 50, 0.18)';
+        energyCtx.fill();
+
+        // Actual curve stroke
+        energyCtx.beginPath();
+        for (let i = 0; i < energyData.length; i += 2) {
+            const d = energyData[i];
+            const ke = energyData[i + 1];
+            const px = pad.l + (d / maxDist) * cw;
+            const py = pad.t + ch - ke * ch;
+            if (i === 0) energyCtx.moveTo(px, py);
+            else energyCtx.lineTo(px, py);
+        }
+        energyCtx.strokeStyle = '#ffc832';
+        energyCtx.lineWidth = 2;
+        energyCtx.stroke();
+    }
+}
+
+function toggleEnergyChart() {
+    showEnergyChart = !showEnergyChart;
+    energyCanvas.style.display = showEnergyChart ? 'block' : 'none';
+    if (!showEnergyChart) energyCtx.clearRect(0, 0, energyCanvas.width, energyCanvas.height);
+}
+
+// ===================================================================
+// PHASE SPACE PORTRAIT
+// ===================================================================
+const phaseCanvas = document.getElementById('phase-chart');
+const phaseCtx    = phaseCanvas.getContext('2d');
+let showPhaseChart = false;
+let phaseData      = [];   // [vx, vz, vx, vz, ...]  — recorded every 3rd frame
+let phaseV0        = 1;    // initial speed for axis scaling
+
+function drawPhaseChart() {
+    if (!showPhaseChart) return;
+    const W = phaseCanvas.width, H = phaseCanvas.height;
+    phaseCtx.clearRect(0, 0, W, H);
+    phaseCtx.fillStyle = 'rgba(0,0,0,0.75)';
+    phaseCtx.fillRect(0, 0, W, H);
+
+    const pad = { l: 42, r: 14, t: 22, b: 30 };
+    const cw = W - pad.l - pad.r, ch = H - pad.t - pad.b;
+    const cx = pad.l + cw / 2, cy = pad.t + ch / 2;
+    const scale = Math.min(cw, ch) / 2;
+    const maxV  = Math.max(phaseV0 * 1.05, 0.01);
+
+    // Grid
+    phaseCtx.strokeStyle = 'rgba(255,255,255,0.08)';
+    phaseCtx.lineWidth = 1;
+    for (let g = -1; g <= 1; g += 0.5) {
+        const px = cx + g * scale;
+        const py = cy + g * scale;
+        phaseCtx.beginPath(); phaseCtx.moveTo(px, pad.t); phaseCtx.lineTo(px, pad.t + ch); phaseCtx.stroke();
+        phaseCtx.beginPath(); phaseCtx.moveTo(pad.l, py); phaseCtx.lineTo(pad.l + cw, py); phaseCtx.stroke();
+    }
+
+    // Axes
+    phaseCtx.strokeStyle = 'rgba(255,255,255,0.4)';
+    phaseCtx.lineWidth = 1.5;
+    phaseCtx.beginPath(); phaseCtx.moveTo(cx, pad.t); phaseCtx.lineTo(cx, pad.t + ch); phaseCtx.stroke();
+    phaseCtx.beginPath(); phaseCtx.moveTo(pad.l, cy); phaseCtx.lineTo(pad.l + cw, cy); phaseCtx.stroke();
+
+    // Axis labels
+    phaseCtx.fillStyle = '#aaa'; phaseCtx.font = '15px monospace';
+    phaseCtx.textAlign = 'center'; phaseCtx.textBaseline = 'top';
+    phaseCtx.fillText('vx', pad.l + cw - 2, cy + 4);
+    phaseCtx.textAlign = 'left'; phaseCtx.textBaseline = 'middle';
+    phaseCtx.fillText('vz', cx + 4, pad.t + 4);
+
+    // Title
+    phaseCtx.fillStyle = '#666'; phaseCtx.textAlign = 'left'; phaseCtx.textBaseline = 'top';
+    phaseCtx.fillText('Phase space  (vx, vz)', pad.l, 4);
+
+    // Origin target
+    phaseCtx.fillStyle = '#ff4444';
+    phaseCtx.beginPath(); phaseCtx.arc(cx, cy, 4, 0, Math.PI * 2); phaseCtx.fill();
+
+    if (phaseData.length < 4) return;
+
+    // Trajectory — colour by speed magnitude
+    phaseCtx.lineWidth = 1.8;
+    for (let i = 2; i < phaseData.length; i += 2) {
+        const vx0 = phaseData[i-2], vz0 = phaseData[i-1];
+        const vx1 = phaseData[i],   vz1 = phaseData[i+1];
+        const ratio = Math.hypot(vx1, vz1) / maxV;
+        const [r, g, b] = trailSpeedColor(Math.min(1, ratio));
+        phaseCtx.strokeStyle = `rgb(${(r*255)|0},${(g*255)|0},${(b*255)|0})`;
+        phaseCtx.beginPath();
+        phaseCtx.moveTo(cx + (vx0 / maxV) * scale, cy - (vz0 / maxV) * scale);
+        phaseCtx.lineTo(cx + (vx1 / maxV) * scale, cy - (vz1 / maxV) * scale);
+        phaseCtx.stroke();
+    }
+
+    // Current point
+    const n = phaseData.length;
+    const cvx = phaseData[n-2], cvz = phaseData[n-1];
+    phaseCtx.fillStyle = '#fff';
+    phaseCtx.beginPath();
+    phaseCtx.arc(cx + (cvx / maxV) * scale, cy - (cvz / maxV) * scale, 3, 0, Math.PI*2);
+    phaseCtx.fill();
+}
+
+function togglePhaseChart() {
+    showPhaseChart = !showPhaseChart;
+    phaseCanvas.style.display = showPhaseChart ? 'block' : 'none';
+    if (!showPhaseChart) phaseCtx.clearRect(0, 0, phaseCanvas.width, phaseCanvas.height);
+}
+
+
+// ===================================================================
 // METRICS PANEL
 // ===================================================================
 const metricsPanel = document.getElementById('metrics-panel');
@@ -1846,6 +2418,42 @@ const mEntryAngle = document.getElementById('m-entry-angle');
 
 document.getElementById('metrics-toggle').addEventListener('click', () => {
     metricsPanel.classList.toggle('collapsed');
+});
+
+// ===================================================================
+// D-PAD
+// ===================================================================
+const dpadEl = document.getElementById('dpad');
+const dpadMap = {
+    'dpad-up':    'ArrowUp',
+    'dpad-down':  'ArrowDown',
+    'dpad-left':  'ArrowLeft',
+    'dpad-right': 'ArrowRight',
+};
+Object.entries(dpadMap).forEach(([id, key]) => {
+    const btn = document.getElementById(id);
+    btn.addEventListener('pointerdown', e => { e.preventDefault(); keysHeld[key] = true; });
+    btn.addEventListener('pointerup',     () => { delete keysHeld[key]; });
+    btn.addEventListener('pointerleave',  () => { delete keysHeld[key]; });
+    btn.addEventListener('pointercancel', () => { delete keysHeld[key]; });
+});
+
+// Distance +/- buttons
+const dpadDistLabel = document.getElementById('dpad-dist-label');
+function updateDistLabel() {
+    dpadDistLabel.textContent = ballCircleRadius.toFixed(1);
+}
+document.getElementById('dpad-dist-minus').addEventListener('click', () => {
+    if (ballMoving || !ballOnCircle) return;
+    ballCircleRadius = Math.max(BALL_CIRCLE_MIN, ballCircleRadius - BALL_CIRCLE_STEP);
+    updateBallOnCircle();
+    updateDistLabel();
+});
+document.getElementById('dpad-dist-plus').addEventListener('click', () => {
+    if (ballMoving || !ballOnCircle) return;
+    ballCircleRadius = Math.min(BALL_CIRCLE_MAX, ballCircleRadius + BALL_CIRCLE_STEP);
+    updateBallOnCircle();
+    updateDistLabel();
 });
 
 function updateMetrics() {
@@ -1948,11 +2556,11 @@ window.addEventListener('keydown', (e) => {
         if ((e.key === 'r' || e.key === 'R') && !e.repeat) resetBall(e.shiftKey);
         if (e.key === '1' && !ballMoving && ballOnCircle) {
             ballCircleRadius = Math.max(BALL_CIRCLE_MIN, ballCircleRadius - BALL_CIRCLE_STEP);
-            updateBallOnCircle();
+            updateBallOnCircle(); updateDistLabel();
         }
         if (e.key === '2' && !ballMoving && ballOnCircle) {
             ballCircleRadius = Math.min(BALL_CIRCLE_MAX, ballCircleRadius + BALL_CIRCLE_STEP);
-            updateBallOnCircle();
+            updateBallOnCircle(); updateDistLabel();
         }
         if (e.key === '3') launchAngleDeg = Math.max(LAUNCH_ANGLE_MIN, launchAngleDeg - LAUNCH_ANGLE_STEP);
         if (e.key === '4') launchAngleDeg = Math.min(LAUNCH_ANGLE_MAX, launchAngleDeg + LAUNCH_ANGLE_STEP);
@@ -2037,10 +2645,10 @@ renderer.domElement.addEventListener('wheel', () => {
 // ===================================================================
 function cycleFlowMode() {
     flowMode = (flowMode + 1) % 5;
-    flowGroup.visible = flowMode === 1;
-    gridFlowGroup.visible = flowMode === 2;
-    gradientGroup.visible = flowMode === 3;
-    contourGroup.visible = flowMode === 4;
+    flowGroup.visible      = flowMode === 1;
+    gridFlowGroup.visible  = flowMode === 2;
+    gradientGroup.visible  = flowMode === 3;
+    contourGroup.visible   = flowMode === 4;
     if (flowMode === 1 && flowStreamlines.length === 0) rebuildFlowVisuals();
     if (flowMode === 2 && gridFlowParticles.length === 0) rebuildGridFlow();
     if (flowMode === 3) { gradientDirty = false; buildGradientArrows(); }
@@ -2059,13 +2667,19 @@ function resetCamera() {
 // TOUCH UI — SLIDERS & BUTTONS
 // ===================================================================
 
-// ---- Slider panel toggle ----
-const sliderPanel = document.getElementById('slider-panel');
-const sliderToggle = document.getElementById('slider-toggle');
-sliderToggle.addEventListener('click', () => {
-    sliderPanel.classList.toggle('collapsed');
-    sliderToggle.textContent = sliderPanel.classList.contains('collapsed') ? '\u00AB' : '\u00BB';
-});
+// ---- Side panel toggles ----
+for (const { panelId, toggleId } of [
+    { panelId: 'panel-green',    toggleId: 'toggle-green'    },
+    { panelId: 'panel-lighting', toggleId: 'toggle-lighting' },
+]) {
+    const panel  = document.getElementById(panelId);
+    const toggle = document.getElementById(toggleId);
+    toggle.addEventListener('click', () => {
+        panel.classList.toggle('collapsed');
+        toggle.querySelector('.panel-arr').textContent =
+            panel.classList.contains('collapsed') ? '\u00BB' : '\u00AB';
+    });
+}
 
 // ---- Slider → variable wiring ----
 const slAngle  = document.getElementById('sl-angle');
@@ -2161,14 +2775,17 @@ document.getElementById('action-btns').addEventListener('click', (e) => {
         case 'newTerrain':  resetBall(true); break;
         case 'cycleFlow':   cycleFlowMode(); break;
         case 'resetCam':    resetCamera(); break;
-        case 'toggleSpeed': toggleSpeedChart(); break;
-        case 'startGame':   startGame(); break;
+        case 'toggleSpeed':   toggleSpeedChart(); break;
+        case 'toggleEnergy':  toggleEnergyChart(); break;
+        case 'togglePhase':   togglePhaseChart();  break;
+
+        case 'startGame':     startGame(); break;
     }
 });
 
 // ---- OrbitControls safety guard for slider interaction ----
 let _sliderActive = false;
-document.getElementById('slider-content').addEventListener('pointerdown', () => {
+document.getElementById('panels-container').addEventListener('pointerdown', () => {
     _sliderActive = true;
     controls.enabled = false;
 });
@@ -2179,11 +2796,8 @@ window.addEventListener('pointerup', () => {
     }
 });
 
-// ---- Light debug sliders (inside slider panel) ----
+// ---- Light debug sliders ----
 {
-    const ldSection = document.getElementById('ld-section');
-    if (window.SHOW_LIGHT_DEBUG) ldSection.style.display = 'block';
-
     const ldSliders = [
         { id: 'ld-diffuse',  valId: 'ld-v-diffuse',  uniform: 'uEnDiffuse',    decimals: 2 },
         { id: 'ld-ambient',  valId: 'ld-v-ambient',   uniform: 'uEnAmbient',    decimals: 2 },
@@ -2209,6 +2823,8 @@ window.addEventListener('pointerup', () => {
         dirLight.intensity = v;
     });
 }
+
+
 
 // ---- Touch aiming (tap on canvas to set aim point) ----
 let _touchStartPos = null;
@@ -2293,9 +2909,9 @@ function startGame() {
     // Hide free-play UI (keep stats visible)
     clearGuide();
     helpEl.style.display = 'none';
-    sliderPanel.classList.add('collapsed');
-    sliderPanel.style.display = 'none';
+    document.getElementById('panels-container').style.display = 'none';
     document.getElementById('action-btns').style.display = 'none';
+    dpadEl.style.display = 'none';
     gameOverEl.classList.remove('show');
     // Show game HUD + exit button + hint
     gameHudEl.style.display = 'block';
@@ -2364,7 +2980,7 @@ function setupHole(index) {
     updateScorecard();
 }
 
-function scoreShot(oob) {
+function scoreShot(oob, tooFast = false) {
     const distToHole = Math.hypot(ballPos[0], ballPos[2]);
     const ballDiam = 2 * BALL_RADIUS_M;
     let pts = 0;
@@ -2373,6 +2989,9 @@ function scoreShot(oob) {
     if (oob) {
         pts = 0;
         label = 'Out of bounds! +0';
+    } else if (tooFast) {
+        pts = 5;
+        label = 'Ball too fast! +5';
     } else if (inHole) {
         pts = 10;
         label = 'IN THE HOLE! +10';
@@ -2447,13 +3066,15 @@ function exitGame() {
     // Restore free-play UI
     statsEl.style.display = '';
     helpEl.style.display = '';
-    sliderPanel.style.display = '';
+    document.getElementById('panels-container').style.display = '';
     document.getElementById('action-btns').style.display = '';
+    dpadEl.style.display = '';
     // Reset to defaults
     angleDeg = 0;
     stimpM = STIMP_DEFAULT;
     setTrueRollStrength(1.0);
     ballCircleRadius = BALL_CIRCLE_RADIUS_DEFAULT;
+    updateDistLabel();
     launchAngleDeg = LAUNCH_ANGLE_DEFAULT;
     resetBall(true);
     resetCamera();
@@ -2479,9 +3100,10 @@ function shoot() {
     clearGuide();
     speedData = [];
     speedSampleCounter = 0;
+    energyData = [];
+    phaseData  = [];
     speedAtHole = null;
     maxLateralDev = 0;
-    breakApexPct = 0;
     breakApexTravelDist = 0;
     lineErrorAtHole = null;
     entryAngle = null;
@@ -2501,6 +3123,9 @@ function shoot() {
     ballVel[1] = totalSpeed * Math.sin(launchRad);
     ballVel[2] = speedH * dzn;
     initialSpeed = speedH;
+    phaseV0    = speedH;
+    launchV0sq = speedH * speedH;
+    launchMu = stimpToMu(stimpM);
 
     ballMoving = true;
     ballOnCircle = false;
@@ -2510,6 +3135,10 @@ function shoot() {
     maxHeight = ballPos[1];
     ballSpin = launchAngleDeg / 15.0;
     travelDist = 0.0;
+
+    const maxHeightCm  = ballVel[1] > 0 ? (ballVel[1] * ballVel[1]) / (2 * GRAVITY) * 100 : 0;
+    const flightLenCm  = ballVel[1] > 0 ? (speedH * ballVel[1] / GRAVITY) * 100 : 0;
+    showShotPopup(totalSpeed, maxHeightCm, flightLenCm, launchAngleDeg, ballSpin);
 
     // Game mode: transition to 'moving'
     if (gameState === 'putting') {
@@ -2582,6 +3211,7 @@ function updateBallOnCircle() {
     const bz = ballCircleRadius * Math.sin(ballAngle);
     const by = getTerrainHeight(bx, bz) + BALL_RADIUS_M;
     ballPos = [bx, by, bz];
+
 }
 
 // ===================================================================
@@ -2630,8 +3260,8 @@ function updatePhysics(dt) {
             az -= friction * spinMod * (ballVel[2] / speed);
 
             // Local terrain slope
-            ax += -normal.x * GRAVITY * ROLLING_FACTOR;
-            az += -normal.z * GRAVITY * ROLLING_FACTOR;
+            ax += normal.x * GRAVITY * ROLLING_FACTOR;
+            az += normal.z * GRAVITY * ROLLING_FACTOR;
         }
 
         // Spin decay
@@ -2702,13 +3332,15 @@ function updatePhysics(dt) {
     const distMoved = Math.hypot(newX - ballPos[0], newZ - ballPos[2]);
     travelDist += distMoved;
 
-    // Record speed data for chart
-    if (showSpeedChart) {
-        speedSampleCounter++;
-        if (speedSampleCounter % 3 === 0) {
-            const spd = Math.hypot(ballVel[0], ballVel[2]);
-            speedData.push(travelDist, spd);
+    // Record speed / energy data for charts (always, so charts work when opened after shot)
+    speedSampleCounter++;
+    if (speedSampleCounter % 3 === 0) {
+        const spd = Math.hypot(ballVel[0], ballVel[2]);
+        speedData.push(travelDist, spd);
+        if (launchV0sq > 0) {
+            energyData.push(travelDist, (spd * spd) / launchV0sq);
         }
+        phaseData.push(ballVel[0], ballVel[2]);
     }
 
     // Metrics: speed at hole passage + lateral deviation + entry angle + line error
@@ -2834,7 +3466,7 @@ function updatePhysics(dt) {
             }
 
             // Game mode scoring on hole-in (only if valid)
-            if (gameState === 'moving') scoreShot(!validHoleIn);
+            if (gameState === 'moving') scoreShot(false, !validHoleIn);
             else setGuide(GUIDE.IN_HOLE);
         } else if (distToHole <= HOLE_RADIUS_M) {
             // Lip-out
@@ -2852,7 +3484,10 @@ function updatePhysics(dt) {
         // Don't trace trail inside the hole
         const dTrail = Math.hypot(ballPos[0], ballPos[2]);
         if (dTrail > HOLE_RADIUS_M) {
-            addTrailPoint(ballPos[0], ballPos[1], ballPos[2]);
+            const trailSpd = Math.hypot(ballVel[0], ballVel[2]);
+            const trailRatio = initialSpeed > 0 ? trailSpd / initialSpeed : 0;
+            addTrailPoint(ballPos[0], ballPos[1], ballPos[2], trailRatio);
+            emitTrailParticles(ballPos[0], ballPos[1], ballPos[2], trailRatio);
         }
     }
 
@@ -2932,8 +3567,8 @@ function animate() {
 
     // ---- Held keys ----
     if (!gameState) {
-        if (keysHeld['ArrowUp'])   angleDeg = Math.min(ANGLE_MAX_DEG, angleDeg + ANGLE_STEP_DEG);
-        if (keysHeld['ArrowDown']) angleDeg = Math.max(-ANGLE_MAX_DEG, angleDeg - ANGLE_STEP_DEG);
+        if (keysHeld['ArrowUp'])   angleDeg = Math.max(-ANGLE_MAX_DEG, angleDeg - ANGLE_STEP_DEG);
+        if (keysHeld['ArrowDown']) angleDeg = Math.min(ANGLE_MAX_DEG, angleDeg + ANGLE_STEP_DEG);
         if (keysHeld['q'] || keysHeld['Q']) setTrueRollStrength(Math.max(0, getTrueRollStrength() - 0.1));
         if (keysHeld['w'] || keysHeld['W']) setTrueRollStrength(Math.min(4, getTrueRollStrength() + 0.1));
     }
@@ -3013,8 +3648,12 @@ function animate() {
     }
 
     // ---- HUD ----
+    updateSky(dt);
+    updateTrailParticles();
     updateHUD();
     drawSpeedChart();
+    drawEnergyChart();
+    drawPhaseChart();
     updateMetrics();
 
     // ---- Update green shader uniforms ----
