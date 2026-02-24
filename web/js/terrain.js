@@ -36,7 +36,7 @@ function makeNoiseGrid(size, amplitude, rng) {
     return grid;
 }
 
-function smoothGrid(grid, passes) {
+export function smoothGrid(grid, passes) {
     const size = grid.length;
     let cur = grid;
     for (let p = 0; p < passes; p++) {
@@ -94,6 +94,19 @@ const TR_MIN_SPEED = 0.8;
 
 export function setTrueRollStrength(s) { TRUE_ROLL_STRENGTH = s; }
 export function getTrueRollStrength() { return TRUE_ROLL_STRENGTH; }
+
+// Inject an externally-built height grid (e.g. from GLB raycasting).
+// grid must be a TR_GRID_SIZE x TR_GRID_SIZE array of arrays with values
+// in the range [-TR_TARGET_AMP, TR_TARGET_AMP].
+export function setHeightGrid(grid) { HEIGHT_GRID = grid; }
+
+export function generateHeightGrid(seed) {
+    const rng = makeRng(seed);
+    return normalizeGrid(
+        smoothGrid(makeNoiseGrid(TR_GRID_SIZE, TR_BASE_AMP, rng), TR_SMOOTH_PASSES + 2),
+        TR_TARGET_AMP
+    );
+}
 
 export function buildTrueRollGrids(seed) {
     const rng = makeRng(seed);

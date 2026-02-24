@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Green GLB Exporter</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #14171c; color: #ebebeb; font-family: 'Courier New', monospace; overflow: hidden; }
+  canvas { display: block; }
+  #ui {
+    position: absolute; top: 20px; left: 20px;
+    display: flex; flex-direction: column; gap: 10px; z-index: 10; min-width: 180px;
+  }
+  button {
+    padding: 10px 20px;
+    border: 1px solid rgba(255,255,255,0.3); border-radius: 6px;
+    background: rgba(20,23,28,0.92); color: #ebebeb;
+    font-family: 'Courier New', monospace; font-size: 14px; cursor: pointer;
+  }
+  button:hover { background: rgba(50,55,65,0.95); }
+  #btn-export { border-color: #ffe033; color: #ffe033; font-weight: bold; }
+  #btn-load   { border-color: #7ec8ff; color: #7ec8ff; }
+  #file-input { display: none; }
+  hr { border: none; border-top: 1px solid rgba(255,255,255,0.12); margin: 2px 0; }
+  #status { font-size: 11px; color: rgba(255,255,255,0.45); line-height: 1.6; white-space: pre-line; }
+  #info {
+    position: absolute; bottom: 20px; left: 20px; font-size: 11px;
+    color: rgba(255,255,255,0.35); line-height: 1.6; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <button id="btn-randomize">&#x21BA; New Terrain</button>
+  <button id="btn-export">&#x2913; Export GLB</button>
+  <hr>
+  <button id="btn-load">&#x1F4C2; Load GLB…</button>
+  <input type="file" id="file-input" accept=".glb,.gltf">
+  <div id="status">Building…</div>
+</div>
+
+<div id="info">
+  Orbit: drag &nbsp;|&nbsp; Zoom: wheel<br>
+  Load GLB → extracts terrain → rebuild green
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+// ---- ALL imports at the top (ES module requirement) ----
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFExporter }  from 'three/addons/exporters/GLTFExporter.js';
+import { GLTFLoader }    from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader }   from 'three/addons/loaders/DRACOLoader.js';
+import {
+    buildTrueRollGrids, getTerrainHeight,
+    TR_GRID_SIZE, TR_WORLD_SIZE, TR_TARGET_AMP
+} from './js/terrain.js';
+import { greenSignedDistance, generateShapeSeeds } from './js/greenShape.js';
+
+// ---- Local helpers (no new terrain.js exports needed) ----
+const HEIGHT_SCALE = 0.01;  // matches terrain.js
+
+// ---- GLTF loader with Draco decompression support ----
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/draco/');
+const gltfLoader = new GLTFLoader();
+gltfLoader.setDRACOLoader(dracoLoader);
+
+function localBilinear(grid, x, z) {
+    const size = grid.length, half = TR_WORLD_SIZE / 2;
+    const u  = Math.min(Math.max((x + half) / TR_WORLD_SIZE, 0), 1);
+    const v  = Math.min(Math.max((z + half) / TR_WORLD_SIZE, 0), 1);
+    const fx = u * (size - 1), fy = v * (size - 1);
+    const x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const x1 = Math.min(x0 + 1, size - 1), y1 = Math.min(y0 + 1, size - 1);
+    const tx = fx - x0, ty = fy - y0;
+    return (grid[y0][x0]*(1-tx) + grid[y0][x1]*tx)*(1-ty) +
+           (grid[y1][x0]*(1-tx) + grid[y1][x1]*tx)*ty;
+}
+
+// Active height function — swapped between procedural and GLB-sourced
+let activeHeightFn = getTerrainHeight;
+
+function computeNormal(x, z) {
+    const eps = 0.05;
+    const dx  = (activeHeightFn(x+eps,z) - activeHeightFn(x-eps,z)) / (2*eps);
+    const dz  = (activeHeightFn(x,z+eps) - activeHeightFn(x,z-eps)) / (2*eps);
+    const len = Math.sqrt(dx*dx + 1 + dz*dz);
+    return { x: -dx/len, y: 1/len, z: -dz/len };
+}
+
+// ---- Constants ----
+const BALL_RADIUS_M = 0.0215;
+const HOLE_RADIUS_M = 2.0 * BALL_RADIUS_M;
+const outerRim      = HOLE_RADIUS_M + 0.012;
+const collarOuter   = HOLE_RADIUS_M + 0.02 + 0.30;
+const HOLE_DEPTH    = 0.20;
+
+// ---- Renderer ----
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.prepend(renderer.domElement);
+
+// ---- Scene ----
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1c2535);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.01, 200);
+camera.position.set(0, 9, 7);
+camera.lookAt(0, 0, 0);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.1;
+controls.minDistance   = 2;
+controls.maxDistance   = 30;
+controls.update();
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const sun = new THREE.DirectionalLight(0xfff4e0, 1.3);
+sun.position.set(10, 14, 6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.near = 1;  sun.shadow.camera.far  = 80;
+sun.shadow.camera.left = -10; sun.shadow.camera.right = 10;
+sun.shadow.camera.top  =  10; sun.shadow.camera.bottom = -10;
+scene.add(sun);
+
+scene.add(new THREE.GridHelper(12, 12, 0x334455, 0x223344));
+
+// ---- Materials ----
+const greenMat  = new THREE.MeshStandardMaterial({ color: 0x3c8828, roughness: 0.85 });
+const collarMat = new THREE.MeshStandardMaterial({ color: 0x346020, roughness: 0.90 });
+const cupMat    = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 1.0, side: THREE.BackSide });
+const bottomMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 1.0 });
+const rimMat    = new THREE.MeshStandardMaterial({ color: 0xf0f0f0, roughness: 0.5, metalness: 0.1 });
+
+// ---- Export group (reconstructed green for export) ----
+const exportGroup = new THREE.Group();
+scene.add(exportGroup);
+
+// ---- Preview group (loaded GLB geometry, shown instead of exportGroup) ----
+const glbPreviewGroup = new THREE.Group();
+scene.add(glbPreviewGroup);
+
+// ---- Build green from activeHeightFn ----
+function buildGreen() {
+    exportGroup.clear();
+
+    const gridSize  = TR_GRID_SIZE;
+    const halfWorld = TR_WORLD_SIZE / 2;
+    const step      = TR_WORLD_SIZE / (gridSize - 1);
+    const sdfMargin  = 0.5;
+    const holeMargin = HOLE_RADIUS_M + 0.02;
+
+    const vertMap   = new Int32Array(gridSize * gridSize).fill(-1);
+    const positions = [], normals = [], indices = [];
+    let vertCount = 0;
+
+    function getOrCreate(ix, iz) {
+        const key = iz * gridSize + ix;
+        if (vertMap[key] >= 0) return vertMap[key];
+        const x = -halfWorld + ix * step;
+        const z = -halfWorld + iz * step;
+        const h = activeHeightFn(x, z);
+        const n = computeNormal(x, z);
+        positions.push(x, h, z);
+        normals.push(n.x, n.y, n.z);
+        vertMap[key] = vertCount;
+        return vertCount++;
+    }
+
+    for (let iy = 0; iy < gridSize - 1; iy++) {
+        for (let ix = 0; ix < gridSize - 1; ix++) {
+            const cx = -halfWorld + (ix + 0.5) * step;
+            const cz = -halfWorld + (iy + 0.5) * step;
+            if (greenSignedDistance(cx, cz) > sdfMargin) continue;
+            if (Math.hypot(cx, cz) < holeMargin) continue;
+            const v00 = getOrCreate(ix,   iy  );
+            const v10 = getOrCreate(ix+1, iy  );
+            const v01 = getOrCreate(ix,   iy+1);
+            const v11 = getOrCreate(ix+1, iy+1);
+            indices.push(v00, v11, v10);
+            indices.push(v00, v01, v11);
+        }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setAttribute('normal',   new THREE.Float32BufferAttribute(normals,   3));
+    geo.setIndex(indices);
+    const gm = new THREE.Mesh(geo, greenMat);
+    gm.name = 'green_surface'; gm.receiveShadow = true;
+    exportGroup.add(gm);
+
+    // Collar
+    const cg = new THREE.RingGeometry(outerRim, collarOuter, 64);
+    cg.rotateX(-Math.PI/2);
+    const cm = new THREE.Mesh(cg, collarMat);
+    cm.name = 'collar'; cm.position.y = 0.001; cm.receiveShadow = true;
+    exportGroup.add(cm);
+
+    // Rim lip
+    const rg = new THREE.RingGeometry(HOLE_RADIUS_M, outerRim, 48);
+    rg.rotateX(-Math.PI/2);
+    const rm = new THREE.Mesh(rg, rimMat);
+    rm.name = 'hole_rim'; rm.position.y = 0.002;
+    exportGroup.add(rm);
+
+    // Cup
+    const ug = new THREE.CylinderGeometry(HOLE_RADIUS_M, HOLE_RADIUS_M, HOLE_DEPTH, 32, 1, true);
+    const um = new THREE.Mesh(ug, cupMat);
+    um.name = 'hole_cup'; um.position.y = -HOLE_DEPTH/2;
+    exportGroup.add(um);
+
+    // Bottom
+    const bg = new THREE.CircleGeometry(HOLE_RADIUS_M, 32);
+    bg.rotateX(-Math.PI/2);
+    const bm = new THREE.Mesh(bg, bottomMat);
+    bm.name = 'hole_bottom'; bm.position.y = -HOLE_DEPTH;
+    exportGroup.add(bm);
+
+    document.getElementById('status').textContent =
+        `Vertices: ${vertCount.toLocaleString()}\nTriangles: ${(indices.length/3).toLocaleString()}`;
+}
+
+// ---- New procedural terrain ----
+function newTerrain() {
+    glbPreviewGroup.clear();
+    document.getElementById('status').textContent = 'Building…';
+    activeHeightFn = getTerrainHeight;
+    generateShapeSeeds();
+    buildTrueRollGrids(null);
+    buildGreen();
+}
+
+// ---- Export GLB ----
+document.getElementById('btn-randomize').addEventListener('click', newTerrain);
+
+document.getElementById('btn-export').addEventListener('click', () => {
+    const status = document.getElementById('status');
+    buildGreen(); // Rebuild from current activeHeightFn (GLB-derived or procedural)
+    status.textContent = 'Exporting…';
+    new GLTFExporter().parse(
+        exportGroup,
+        (glb) => {
+            const a = document.createElement('a');
+            a.href     = URL.createObjectURL(new Blob([glb], { type: 'application/octet-stream' }));
+            a.download = 'green.glb';
+            a.click();
+            status.textContent = 'Saved → green.glb ✓';
+        },
+        (err) => { status.textContent = 'Export error: ' + err; },
+        { binary: true }
+    );
+});
+
+// ---- Load GLB → extract height grid → rebuild green ----
+document.getElementById('btn-load').addEventListener('click', () => {
+    document.getElementById('file-input').click();
+});
+
+document.getElementById('file-input').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const status = document.getElementById('status');
+    status.textContent = `Loading ${file.name}…`;
+    exportGroup.clear();
+    e.target.value = '';
+
+    const url = URL.createObjectURL(file);
+    gltfLoader.load(url, (gltf) => {
+        URL.revokeObjectURL(url);
+
+        // Center and scale model to fit the 12 m world
+        const root = gltf.scene;
+        root.updateMatrixWorld(true); // propagate child transforms BEFORE measuring
+        const box    = new THREE.Box3().setFromObject(root);
+        if (box.isEmpty()) { status.textContent = 'GLB has no geometry.'; return; }
+        const center = box.getCenter(new THREE.Vector3());
+        const size   = box.getSize(new THREE.Vector3());
+        const maxXZ = Math.max(size.x, size.z);
+        const s = maxXZ > 0.001 ? TR_WORLD_SIZE / maxXZ : 1;
+        root.scale.setScalar(s);
+        // Position must account for scale: world_center = position + s*center = 0
+        // → position = -s * center
+        root.position.set(-center.x * s, -center.y * s, -center.z * s);
+        root.updateMatrixWorld(true); // update again after position/scale change
+        // Disable frustum culling on all meshes (bounding spheres may be stale after scale)
+        root.traverse(o => { if (o.isMesh) o.frustumCulled = false; });
+
+        // Find largest mesh with a position attribute (green surface)
+        let targetMesh = null, maxVerts = 0;
+        root.traverse(o => {
+            if (o.isMesh && o.geometry?.attributes?.position) {
+                const n = o.geometry.attributes.position.count;
+                if (n > maxVerts) { maxVerts = n; targetMesh = o; }
+            }
+        });
+
+        if (!targetMesh) { status.textContent = 'No mesh found in GLB.'; return; }
+
+        // Raycast grid to extract heights
+        const ray = new THREE.Raycaster();
+        ray.ray.direction.set(0, -1, 0);
+        const gs = TR_GRID_SIZE, hw = TR_WORLD_SIZE / 2, stp = TR_WORLD_SIZE / (gs - 1);
+        const grid = Array.from({ length: gs }, () => new Array(gs).fill(0));
+        let sumH = 0, hits = 0;
+
+        for (let iz = 0; iz < gs; iz++) {
+            for (let ix = 0; ix < gs; ix++) {
+                const x = -hw + ix * stp, z = -hw + iz * stp;
+                ray.ray.origin.set(x, 20, z);
+                const res = ray.intersectObject(targetMesh, false);
+                if (res.length > 0) {
+                    grid[iz][ix] = res[0].point.y;
+                    sumH += res[0].point.y;
+                    hits++;
+                }
+            }
+        }
+
+        // Center around 0
+        if (hits > 0) {
+            const mean = sumH / hits;
+            for (let iz = 0; iz < gs; iz++)
+                for (let ix = 0; ix < gs; ix++)
+                    grid[iz][ix] -= mean;
+        }
+
+        // Normalize magnitude to TR_TARGET_AMP (preserves shape)
+        let maxAbs = 0;
+        for (let iz = 0; iz < gs; iz++)
+            for (let ix = 0; ix < gs; ix++)
+                maxAbs = Math.max(maxAbs, Math.abs(grid[iz][ix]));
+        const rangeM = maxAbs;
+        if (maxAbs > 1e-9) {
+            const s = TR_TARGET_AMP / maxAbs;
+            for (let iz = 0; iz < gs; iz++)
+                for (let ix = 0; ix < gs; ix++)
+                    grid[iz][ix] *= s;
+        }
+
+        // Swap height function for physics / export
+        activeHeightFn = (x, z) => localBilinear(grid, x, z) * HEIGHT_SCALE;
+
+        // Display the loaded GLB geometry; hide the procedural green
+        exportGroup.clear();
+        glbPreviewGroup.clear();
+        glbPreviewGroup.add(root);
+
+        status.textContent =
+            `From: ${file.name}\n` +
+            `Coverage: ${((hits/(gs*gs))*100).toFixed(0)}%\n` +
+            `Height range: ±${(rangeM*100).toFixed(2)} cm\n` +
+            `→ Export GLB to bake as STIMP terrain`;
+
+    }, undefined, (err) => {
+        URL.revokeObjectURL(url);
+        status.textContent = 'Load error: ' + (err.message || err);
+    });
+});
+
+// ---- Render loop ----
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+(function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+})();
+
+// ---- Initial build ----
+newTerrain();
+</script>
+</body>
+</html>

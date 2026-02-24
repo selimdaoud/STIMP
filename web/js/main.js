@@ -1,15 +1,21 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+// GLTFLoader no longer needed in main.js — imported inside glbLoader.js
+import { Sky } from 'three/addons/objects/Sky.js';
 import {
     buildTrueRollGrids, getTerrainHeight, getTerrainNormal, trueRollAccel,
     setTrueRollStrength, getTrueRollStrength,
-    TR_GRID_SIZE, TR_WORLD_SIZE, HEIGHT_SCALE, TR_TARGET_AMP
+    TR_GRID_SIZE, TR_WORLD_SIZE,
+    setHeightGrid
 } from './terrain.js';
 import { greenSignedDistance, generateShapeSeeds, getShapeSeeds, greenBoundingRadius } from './greenShape.js';
 import { createGreenMaterial } from './greenShader.js';
+import { loadGLBTerrain, extractHeightGridFromGLB, applyGLBHeightVariation } from './glbLoader.js';
+import { simulateGhostRest, solveHintTrajectory, simulateTrajectory } from './physics.js';
 
 // ---- Constants (match Python) ----
-const BG_COLOR = new THREE.Color(0.0, 0.0, 0.015);
+
 const BALL_RADIUS_M = 0.0215;
 const HOLE_RADIUS_M = 2.0 * BALL_RADIUS_M;
 const CAMERA_HEIGHT = 5.0;
@@ -67,7 +73,6 @@ function getGradientAt(x, z, curAngleDeg) {
 
 // ---- Scene setup ----
 const scene = new THREE.Scene();
-scene.background = BG_COLOR;
 
 const camera = new THREE.PerspectiveCamera(
     ZOOM_DEFAULT, window.innerWidth / window.innerHeight, 0.01, 1200
@@ -78,12 +83,97 @@ camera.lookAt(0, 0, 0);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(window.devicePixelRatio);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.6;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.prepend(renderer.domElement);
+
+// EXR used only for environment lighting (not visual background)
+new EXRLoader().load('textures/sky.exr', (tex) => {
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    pmrem.compileEquirectangularShader();
+    scene.environment = pmrem.fromEquirectangular(tex).texture;
+    tex.dispose();
+    pmrem.dispose();
+});
+
+// ---- Atmospheric sky ----
+{
+    const sky = new Sky();
+    sky.scale.setScalar(450);
+    scene.add(sky);
+    const u = sky.material.uniforms;
+    u['turbidity'].value      = 3.0;   // slight haze
+    u['rayleigh'].value       = 1.8;   // blue sky intensity
+    u['mieCoefficient'].value = 0.004;
+    u['mieDirectionalG'].value = 0.82;
+    // Sun: ~20° elevation, azimuth matching the lateral dirLight direction
+    const sunPos = new THREE.Vector3();
+    sunPos.setFromSphericalCoords(1,
+        THREE.MathUtils.degToRad(90 - 20),   // polar (from zenith)
+        THREE.MathUtils.degToRad(200)         // azimuth
+    );
+    u['sunPosition'].value.copy(sunPos);
+}
+
+// ---- Procedural cloud layer ----
+{
+    const cloudVS = `varying vec2 vW;
+        void main(){ vW = position.xz; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); }`;
+    const cloudFS = `precision mediump float;
+        varying vec2 vW;
+        float rand(vec2 s){ return fract(sin(dot(s,vec2(12.9898,78.233)))*43758.5453); }
+        float noise(vec2 s){
+            vec2 i=floor(s),f=fract(s); f=f*f*(3.-2.*f);
+            return mix(mix(rand(i),rand(i+vec2(1,0)),f.x),
+                       mix(rand(i+vec2(0,1)),rand(i+vec2(1,1)),f.x),f.y);
+        }
+        float fbm(vec2 p){
+            float v=0.,a=0.5;
+            for(int i=0;i<6;i++){ v+=a*noise(p); p=p*2.1+vec2(1.7,9.2); a*=0.5; }
+            return v;
+        }
+        void main(){
+            vec2 uv = vW / 280.0;          // world → 0..1
+            float c = fbm(uv * 5.0) - 0.38;
+            c = smoothstep(0.0, 0.35, c);
+            // thin out near horizon edges
+            float edge = length(uv - 0.5) * 2.0;
+            c *= 1.0 - smoothstep(0.55, 1.0, edge);
+            if(c < 0.01) discard;
+            // bright white centre, slightly grey at edges
+            vec3 col = mix(vec3(0.82,0.84,0.86), vec3(1.0), c);
+            gl_FragColor = vec4(col, c * 0.88);
+        }`;
+    const cloudGeo = new THREE.PlaneGeometry(560, 560);
+    cloudGeo.rotateX(-Math.PI / 2);
+    const cloudMesh = new THREE.Mesh(cloudGeo, new THREE.ShaderMaterial({
+        vertexShader: cloudVS,
+        fragmentShader: cloudFS,
+        transparent: true,
+        depthWrite: false,
+    }));
+    cloudMesh.position.y = 38;
+    cloudMesh.renderOrder = -1;
+    scene.add(cloudMesh);
+}
 
 // ---- Lighting ----
 scene.add(new THREE.AmbientLight(0xffffff, 0.4));
 const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-dirLight.position.set(5, 10, 5);
+dirLight.position.set(18, 10, 6);   // lateral low sun
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width  = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near   = 1;
+dirLight.shadow.camera.far    = 120;
+dirLight.shadow.camera.left   = -35;
+dirLight.shadow.camera.right  =  35;
+dirLight.shadow.camera.top    =  35;
+dirLight.shadow.camera.bottom = -35;
+dirLight.shadow.bias = -0.001;
 scene.add(dirLight);
 
 // ---- World group (rotates for slope visualization) ----
@@ -97,14 +187,51 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.1;
 controls.maxPolarAngle = Math.PI / 2 - 0.05;
 controls.minDistance = 1;
-controls.maxDistance = 20;
+controls.maxDistance = 50;
 controls.update();
 
-// ---- Build terrain ----
-buildTrueRollGrids(null);
+// ===================================================================
+// ÉTAT GLOBAL — regroupé en objets pour éviter les TDZ et améliorer la lisibilité
+// ===================================================================
+
+const ball = {
+    pos: [BALL_CIRCLE_RADIUS_DEFAULT, 0, 0],
+    vel: [0, 0, 0],
+    moving: false, onCircle: true, airborne: false, inHole: false,
+    angle: 0, lastCircleAngle: 0, circleRadius: BALL_CIRCLE_RADIUS_DEFAULT,
+    spin: 0, travelDist: 0, maxHeight: 0, bounceCount: 0,
+    launchV0sq: null, launchMu: null, initialSpeed: null,
+    speedAtHole: null, maxLateralDev: 0, lineErrorAtHole: null,
+    entryAngle: null, breakApexTravelDist: 0,
+    breakPoints: [], breakLocked: false,
+    prevVz: null, prevPosForVz: null,
+    closestHoleDist: Infinity, prevHoleDist: null, metricsShotStart: null,
+};
+const env = {
+    angleDeg: 0.0, stimpM: STIMP_DEFAULT, launchAngleDeg: LAUNCH_ANGLE_DEFAULT,
+};
+const glbCtx = {
+    mode: false, sceneRoot: null, meshData: [], baseHeightGrid: null,
+};
+const gameCtx = {
+    state: null, holeIndex: 0, score: 0, scores: [],
+    crossedHole: false, startPos: null,
+};
+const charts = {
+    speedData: [], energyData: [], phaseData: [],
+    speedSampleCounter: 0, phaseV0: null,
+    showSpeed: false, showEnergy: false, showPhase: false,
+};
+const viz = {
+    flowMode: 0, normalsVisible: false, showHelp: false,
+};
 
 // ---- Create green mesh (organic SDF shape + procedural grass shader) ----
 let greenMaterial = null;
+
+// Hole position in world XZ — moveable in GLB mode
+let holeX = 0, holeZ = 0;
+function distToHole(x, z) { return Math.hypot(x - holeX, z - holeZ); }
 
 function buildGreenMesh() {
     const gridSize = TR_GRID_SIZE;
@@ -142,7 +269,7 @@ function buildGreenMesh() {
 
             const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
             if (greenSignedDistance(cx, cz) > sdfMargin) continue;
-            if (Math.hypot(cx, cz) < holeMargin) continue;
+            if (distToHole(cx, cz) < holeMargin) continue;
 
             const v00 = getOrCreateVertex(ix, iy);
             const v10 = getOrCreateVertex(ix + 1, iy);
@@ -164,8 +291,126 @@ function buildGreenMesh() {
     return new THREE.Mesh(geometry, greenMaterial);
 }
 
-let greenMesh = buildGreenMesh();
-worldGroup.add(greenMesh);
+let greenMesh;  // assigned in init()
+let decorGroup; // assigned in init() via buildDecor()
+
+// ---- Decorative scene (ground rough, bunkers, trees, cart path) ----
+// Everything goes into a dedicated decorGroup so it can be hidden when a GLB is loaded.
+function buildDecor() {
+    const decorGroup = new THREE.Group();
+    // Shared GLSL noise
+    const noiseFn = `
+        float dRand(vec2 s){ return fract(sin(dot(s,vec2(12.9898,78.233)))*43758.5453); }
+        float dNoise(vec2 s){
+            vec2 i=floor(s),f=fract(s); f=f*f*(3.-2.*f);
+            return mix(mix(dRand(i),dRand(i+vec2(1,0)),f.x),
+                       mix(dRand(i+vec2(0,1)),dRand(i+vec2(1,1)),f.x),f.y);
+        }`;
+    // Vertex shader that passes world XZ position
+    const wposVS = `varying vec2 vW;
+        void main(){ vec4 wp=modelMatrix*vec4(position,1.); vW=wp.xz; gl_Position=projectionMatrix*viewMatrix*wp; }`;
+
+    // 1. Ground / rough grass
+    const groundGeo = new THREE.PlaneGeometry(80, 80);
+    groundGeo.rotateX(-Math.PI / 2);
+    groundGeo.translate(0, -0.005, 0);
+    decorGroup.add(new THREE.Mesh(groundGeo, new THREE.ShaderMaterial({
+        vertexShader: wposVS,
+        fragmentShader: `precision mediump float; varying vec2 vW; ${noiseFn}
+            void main(){
+                vec3 col = vec3(0.17, 0.25, 0.09);
+                col += dNoise(vW*1.8)*0.05 + dNoise(vW*5.0)*0.025 + dNoise(vW*14.0)*0.012;
+                float stripe = sin(vW.y*(3.14159/0.60))*0.5+0.5;
+                col *= mix(0.96, 1.04, stripe);
+                float d = length(vW)/38.0;
+                col = mix(col, vec3(0.13,0.19,0.07), smoothstep(0.55,1.0,d));
+                gl_FragColor = vec4(col, 1.);
+            }`,
+    })));
+
+    // 2. Sand bunkers
+    const bunkerMat = new THREE.ShaderMaterial({
+        vertexShader: wposVS,
+        fragmentShader: `precision mediump float; varying vec2 vW; ${noiseFn}
+            void main(){
+                vec3 sand = vec3(0.87, 0.81, 0.62);
+                sand += dNoise(vW*9.0)*0.07 - dNoise(vW*22.0)*0.03;
+                float rake = sin(vW.x*11.0 + vW.y*2.5)*0.012;
+                sand.r += rake; sand.g += rake*0.8;
+                gl_FragColor = vec4(sand, 1.);
+            }`,
+    });
+    function makeBunker(cx, cz, rx, rz, angleDeg) {
+        const nPts = 14;
+        const ar = angleDeg * Math.PI / 180;
+        const ca = Math.cos(ar), sa = Math.sin(ar);
+        const pts = [];
+        for (let i = 0; i < nPts; i++) {
+            const t = (i / nPts) * Math.PI * 2;
+            const r = 1.0 + 0.20*Math.sin(t*2.3+0.7) + 0.13*Math.sin(t*4.1+1.3) + 0.07*Math.sin(t*6.5+2.1);
+            const lx = Math.cos(t)*rx*r, ly = Math.sin(t)*rz*r;
+            pts.push(new THREE.Vector2(lx*ca - ly*sa, lx*sa + ly*ca));
+        }
+        const geo = new THREE.ShapeGeometry(new THREE.Shape(pts), 20);
+        geo.rotateX(-Math.PI / 2);
+        geo.translate(cx, 0.003, cz);
+        return new THREE.Mesh(geo, bunkerMat);
+    }
+    decorGroup.add(makeBunker(-7.2,  5.8, 2.5, 1.6,  25));
+    decorGroup.add(makeBunker( 6.8,  6.2, 2.2, 1.5, -10));
+    decorGroup.add(makeBunker(-5.8, -6.5, 1.9, 1.3,  15));
+    decorGroup.add(makeBunker( 5.5, -6.0, 1.6, 2.1, -35));
+
+    // 3. Cart path — arc around the right side of the green
+    {
+        const pathShape = new THREE.Shape();
+        pathShape.absarc(0, 0, 12.2, -Math.PI*0.85, Math.PI*0.15, false);
+        pathShape.absarc(0, 0, 11.0,  Math.PI*0.15, -Math.PI*0.85, true);
+        pathShape.closePath();
+        const pgeo = new THREE.ShapeGeometry(pathShape, 48);
+        pgeo.rotateX(-Math.PI / 2);
+        pgeo.translate(0, 0.001, 0);
+        decorGroup.add(new THREE.Mesh(pgeo, new THREE.MeshLambertMaterial({ color: 0x8c8070 })));
+    }
+
+    // 4. Trees — simple low-poly trunk + layered foliage spheres
+    const trunkMat   = new THREE.MeshLambertMaterial({ color: 0x5C3D1E });
+    const foliageMat = new THREE.MeshLambertMaterial({ color: 0x2A5218 });
+    function makeTree(x, z, h) {
+        const g = new THREE.Group();
+        const tk = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.16, h*0.35, 6), trunkMat);
+        tk.position.y = h * 0.175;
+        tk.castShadow = true;
+        g.add(tk);
+        [[0.52, 0.92], [0.68, 0.76], [0.83, 0.58], [0.96, 0.40]].forEach(([yt, r]) => {
+            const foliageSphere = new THREE.Mesh(new THREE.SphereGeometry(r, 7, 5), foliageMat);
+            foliageSphere.position.y = h * yt;
+            foliageSphere.castShadow = true;
+            g.add(foliageSphere);
+        });
+        g.position.set(x, 0, z);
+        return g;
+    }
+    [
+        [-18, -14, 3.8], [-14, -19, 4.2], [  0, -21, 5.0],
+        [ 16, -16, 4.5], [ 20,  -8, 3.6], [ 19,   6, 4.0],
+        [ 15,  17, 4.8], [  0,  21, 4.2], [-16,  17, 3.9],
+        [-20,   4, 4.4], [-19,  -7, 3.5],
+    ].forEach(([x, z, h]) => decorGroup.add(makeTree(x, z, h)));
+
+    // Shadow-receiving plane — transparent except where shadows fall
+    const shadowPlane = new THREE.Mesh(
+        new THREE.PlaneGeometry(80, 80),
+        new THREE.ShadowMaterial({ opacity: 0.35 })
+    );
+    shadowPlane.rotation.x = -Math.PI / 2;
+    shadowPlane.position.y = 0.002;
+    shadowPlane.receiveShadow = true;
+    decorGroup.add(shadowPlane);
+
+    worldGroup.add(decorGroup);
+    return decorGroup;
+}
 
 // ---- Create hole ----
 function buildHole() {
@@ -219,8 +464,21 @@ function buildHole() {
     return group;
 }
 
-const holeGroup = buildHole();
-worldGroup.add(holeGroup);
+let holeGroup; // assigned in init()
+
+function setHolePosition(x, z) {
+    holeX = x;
+    holeZ = z;
+    holeGroup.position.set(holeX, getTerrainHeight(holeX, holeZ), holeZ);
+    // Rebuild green mesh so the hole cutout moves with the hole
+    worldGroup.remove(greenMesh);
+    greenMesh.geometry.dispose();
+    greenMesh = buildGreenMesh();
+    worldGroup.add(greenMesh);
+    if (glbCtx.mode) greenMesh.visible = false;
+    resetBall(false);
+    if (viz.normalsVisible) buildNormalsHelper();
+}
 
 // ---- Create ball (white with glow) ----
 function buildBall() {
@@ -263,8 +521,7 @@ function buildBall() {
     return mesh;
 }
 
-const ballMesh = buildBall();
-worldGroup.add(ballMesh);
+let ballMesh; // assigned in init()
 
 // ---- Ball shadow ----
 const shadowGeo = new THREE.CircleGeometry(BALL_RADIUS_M * 1.2, 16);
@@ -274,53 +531,10 @@ const shadowMat = new THREE.MeshBasicMaterial({
     depthWrite: false, side: THREE.DoubleSide
 });
 const ballShadow = new THREE.Mesh(shadowGeo, shadowMat);
-worldGroup.add(ballShadow);
-
-// ===================================================================
-// GAME STATE
-// ===================================================================
-let angleDeg = 0.0;
-let stimpM = STIMP_DEFAULT;
-let ballAngle = 0.0;
-let lastCircleAngle = 0.0;
-let ballCircleRadius = BALL_CIRCLE_RADIUS_DEFAULT;
-
-let ballPos = [ballCircleRadius, getTerrainHeight(ballCircleRadius, 0) + BALL_RADIUS_M, 0];
-let ballVel = [0, 0, 0];
-let ballMoving = false;
-let ballOnCircle = true;
-let ballAirborne = false;
-let inHole = false;
-let travelDist = 0.0;
-let launchAngleDeg = LAUNCH_ANGLE_DEFAULT;
-let bounceCount = 0;
-let maxHeight = 0.0;
-let ballSpin = 0.0;
-let breakPoints = [];
-let breakLocked = false;
-let prevVz = null;
-let prevPosForVz = null;
-let showHelp = false;
-let showSpeedChart = false;
-let speedData = [];
-let speedSampleCounter = 0;
-let showEnergyChart = false;
-let energyData = [];
-let launchV0sq = null;
-let launchMu = null;
-let speedAtHole = null;
-let maxLateralDev = 0;
-let breakApexTravelDist = 0;
-let lineErrorAtHole = null;
-let entryAngle = null;
-let initialSpeed = null;
-let metricsShotStart = null;
-let closestHoleDist = Infinity;
-let prevHoleDist = Infinity;
-let flowMode = 0; // 0=off, 1=streamlines, 2=grid, 3=break arrows
+// worldGroup.add(ballShadow) + ball.pos init moved to init()
 
 // Aim
-let aimWorld = new THREE.Vector3(ballPos[0], 0, ballPos[2]);
+let aimWorld = new THREE.Vector3(ball.pos[0], 0, ball.pos[2]);
 const mouseNDC = new THREE.Vector2(0, 0);
 let aimLocked = false; // true once the player clicks to set an aimpoint
 
@@ -329,13 +543,6 @@ let shotAimPoints = [];
 let validAimPts = []; // blue aim points for GoodAimZone
 let lastShotStartPos = null; // ball position when last shot was fired
 
-// Game mode state
-let gameState = null; // null = free play, 'putting', 'moving', 'reveal', 'gameover'
-let gameHoleIndex = 0;
-let gameScore = 0;
-let gameCrossedHole = false;
-let gameStartPos = null; // ball position at start of hole for reveal
-let gameHoleScores = []; // per-hole scores
 const GAME_OOB_DIST = 6.0; // ball too far from hole = lost
 
 const GAME_HOLES = [
@@ -355,7 +562,7 @@ const GAME_HOLES = [
 // ===================================================================
 const MAX_TRAIL_PTS = 5000;
 const trailGroup = new THREE.Group();
-worldGroup.add(trailGroup);
+// worldGroup.add(trailGroup) moved to init()
 const trailMat = new THREE.LineBasicMaterial({
     vertexColors: true, depthTest: false,
     blending: THREE.AdditiveBlending, transparent: true,
@@ -527,167 +734,6 @@ function clearTrailParticles() {
 }
 
 // ===================================================================
-// SPACE SKY
-// ===================================================================
-const SKY_R    = 500;
-const COMET_R  = 488;
-const MAX_STARS = 12000;
-
-let starCount  = 3000;
-let skyRotSpeed = 0.0003;
-
-const skyGroup = new THREE.Group();
-scene.add(skyGroup);
-
-// ---- Stars ----
-const starBaseCol  = new Float32Array(MAX_STARS * 3);
-const starColBuf   = new Float32Array(MAX_STARS * 3);
-const starTwkSpd   = new Float32Array(MAX_STARS);
-const starTwkPhs   = new Float32Array(MAX_STARS);
-const starPosBuf   = new Float32Array(MAX_STARS * 3);
-
-for (let i = 0; i < MAX_STARS; i++) {
-    const theta = Math.random() * Math.PI * 2;
-    const phi   = Math.acos(2 * Math.random() - 1);
-    const r     = SKY_R * (0.88 + Math.random() * 0.12);
-    starPosBuf[i*3]   = r * Math.sin(phi) * Math.cos(theta);
-    starPosBuf[i*3+1] = r * Math.cos(phi);
-    starPosBuf[i*3+2] = r * Math.sin(phi) * Math.sin(theta);
-    const bright = 0.45 + Math.random() * 0.55;
-    const warm   = Math.random() < 0.16;
-    const cold   = !warm && Math.random() < 0.2;
-    if (warm) {
-        starBaseCol[i*3] = bright; starBaseCol[i*3+1] = bright*0.65; starBaseCol[i*3+2] = bright*0.25;
-    } else if (cold) {
-        starBaseCol[i*3] = bright*0.55; starBaseCol[i*3+1] = bright*0.75; starBaseCol[i*3+2] = bright;
-    } else {
-        starBaseCol[i*3] = bright*0.82; starBaseCol[i*3+1] = bright*0.88; starBaseCol[i*3+2] = bright;
-    }
-    starColBuf[i*3] = starBaseCol[i*3]; starColBuf[i*3+1] = starBaseCol[i*3+1]; starColBuf[i*3+2] = starBaseCol[i*3+2];
-    starTwkSpd[i] = 0.4 + Math.random() * 3.0;
-    starTwkPhs[i] = Math.random() * Math.PI * 2;
-}
-
-const starsGeo = new THREE.BufferGeometry();
-starsGeo.setAttribute('position', new THREE.BufferAttribute(starPosBuf, 3));
-const starsColAttr = new THREE.BufferAttribute(starColBuf, 3);
-starsColAttr.setUsage(THREE.DynamicDrawUsage);
-starsGeo.setAttribute('color', starsColAttr);
-starsGeo.setDrawRange(0, starCount);
-const starsMat = new THREE.PointsMaterial({ size: 1.6, vertexColors: true, sizeAttenuation: false, depthWrite: false });
-const starsPoints = new THREE.Points(starsGeo, starsMat);
-skyGroup.add(starsPoints);
-
-// ---- Galaxy band (tilted 35°) ----
-const N_GAL  = 4000;
-const gPosBuf = new Float32Array(N_GAL * 3);
-const gColBuf = new Float32Array(N_GAL * 3);
-{
-    const tilt = 35 * Math.PI / 180;
-    const cosT = Math.cos(tilt), sinT = Math.sin(tilt);
-    for (let i = 0; i < N_GAL; i++) {
-        const theta  = Math.random() * Math.PI * 2;
-        const spread = (Math.random() + Math.random() - 1) * 0.20;
-        const phi    = Math.PI / 2 + spread;
-        const r      = SKY_R * 0.93;
-        const x0 = r * Math.sin(phi) * Math.cos(theta);
-        const y0 = r * Math.cos(phi);
-        const z0 = r * Math.sin(phi) * Math.sin(theta);
-        gPosBuf[i*3]   = x0;
-        gPosBuf[i*3+1] = y0 * cosT - z0 * sinT;
-        gPosBuf[i*3+2] = y0 * sinT + z0 * cosT;
-        const t = Math.random();
-        gColBuf[i*3]   = 0.40 + t * 0.55;
-        gColBuf[i*3+1] = 0.10 + t * 0.30;
-        gColBuf[i*3+2] = 0.65 + t * 0.35;
-    }
-}
-const galGeo = new THREE.BufferGeometry();
-galGeo.setAttribute('position', new THREE.BufferAttribute(gPosBuf, 3));
-galGeo.setAttribute('color',    new THREE.BufferAttribute(gColBuf, 3));
-skyGroup.add(new THREE.Points(galGeo,
-    new THREE.PointsMaterial({ size: 1.0, vertexColors: true, sizeAttenuation: false, depthWrite: false, transparent: true, opacity: 0.72 })));
-
-
-// ---- Comets ----
-function makeCometOrbitPlane() {
-    const u = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
-    const tmp = Math.abs(u.x) < 0.8 ? new THREE.Vector3(1,0,0) : new THREE.Vector3(0,1,0);
-    const v = new THREE.Vector3().crossVectors(u, tmp).normalize();
-    const w = new THREE.Vector3().crossVectors(u, v).normalize();
-    return { u: v, v: w };
-}
-
-const comets = Array.from({ length: 7 }, (_, ci) => {
-    const tailLen = 50 + Math.floor(Math.random() * 50);
-    const count   = tailLen + 1;
-    const positions = new Float32Array(count * 3);
-    const colors    = new Float32Array(count * 3);
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
-    geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3).setUsage(THREE.DynamicDrawUsage));
-    geo.setDrawRange(0, 0);
-    const pts = new THREE.Points(geo, new THREE.PointsMaterial({
-        size: 2.0 + Math.random() * 1.5,
-        vertexColors: true, sizeAttenuation: false, depthWrite: false, transparent: true,
-    }));
-    skyGroup.add(pts);
-    const { u, v } = makeCometOrbitPlane();
-    return {
-        pts, geo, positions, colors, u, v, tailLen, trail: [],
-        angle: (ci / 7) * Math.PI * 2 + Math.random() * 0.5,
-        speed: (0.003 + Math.random() * 0.007) * (Math.random() < 0.5 ? 1 : -1),
-        delay: ci * 90, frame: 0,
-    };
-});
-
-// ---- Sky update (called each frame) ----
-let skyTime = 0;
-function updateSky(dt) {
-    skyTime += dt;
-
-    // Slow sky rotation
-    skyGroup.rotation.y += skyRotSpeed;
-
-    // Twinkling: update all stars each frame with sine modulation
-    for (let i = 0; i < starCount; i++) {
-        const twinkle = 0.65 + 0.35 * Math.sin(skyTime * starTwkSpd[i] + starTwkPhs[i]);
-        starColBuf[i*3]   = starBaseCol[i*3]   * twinkle;
-        starColBuf[i*3+1] = starBaseCol[i*3+1] * twinkle;
-        starColBuf[i*3+2] = starBaseCol[i*3+2] * twinkle;
-    }
-    starsColAttr.needsUpdate = true;
-
-    // Comets
-    comets.forEach(c => {
-        c.frame++;
-        if (c.frame < c.delay) return;
-        c.angle += c.speed;
-        const cos = Math.cos(c.angle), sin = Math.sin(c.angle);
-        c.trail.push(
-            COMET_R * (cos * c.u.x + sin * c.v.x),
-            COMET_R * (cos * c.u.y + sin * c.v.y),
-            COMET_R * (cos * c.u.z + sin * c.v.z)
-        );
-        if (c.trail.length > c.tailLen * 3) c.trail.splice(0, 3);
-        const total = c.trail.length / 3;
-        for (let i = 0; i < total; i++) {
-            const src = (total - 1 - i) * 3, dst = i * 3;
-            c.positions[dst]   = c.trail[src];
-            c.positions[dst+1] = c.trail[src+1];
-            c.positions[dst+2] = c.trail[src+2];
-            const fade = Math.pow(1 - i / total, 1.6);
-            c.colors[dst] = fade; c.colors[dst+1] = fade * 0.92; c.colors[dst+2] = fade;
-        }
-        c.geo.attributes.position.needsUpdate = true;
-        c.geo.attributes.color.needsUpdate    = true;
-        c.geo.setDrawRange(0, total);
-    });
-}
-
-
-
-// ===================================================================
 // AIM LINE & DOT
 // ===================================================================
 const aimLineMat = new THREE.LineBasicMaterial({ color: 0xf0d259 });
@@ -718,7 +764,7 @@ let aimPopupTimer = null;
 
 function showAimPopup(screenX, screenY) {
     // Perpendicular distance from hole (0,0) to aim line (ball → aimDot)
-    const bx = ballPos[0], bz = ballPos[2];
+    const bx = ball.pos[0], bz = ball.pos[2];
     const ax = aimWorld.x, az = aimWorld.z;
     const dx = ax - bx, dz = az - bz;
     const lineLen = Math.hypot(dx, dz);
@@ -732,10 +778,10 @@ function showAimPopup(screenX, screenY) {
     const cm = perpDist * 100;
 
     // Height of aim point relative to ball start, accounting for global slope tilt.
-    // worldGroup is rotated by angleDeg around X, so the world-Y of a local point (x, h, z)
+    // worldGroup is rotated by env.angleDeg around X, so the world-Y of a local point (x, h, z)
     // is  h·cos(θ) − z·sin(θ).  For the difference between two surface points:
     //   ΔY = (hAim − hBall)·cos(θ) − (az − bz)·sin(θ)
-    const thetaRad = angleDeg * Math.PI / 180;
+    const thetaRad = env.angleDeg * Math.PI / 180;
     const hAim  = getTerrainHeight(ax, az);
     const hBall = getTerrainHeight(bx, bz);
     const dh = ((hAim - hBall) * Math.cos(thetaRad) - (az - bz) * Math.sin(thetaRad)) * 100;
@@ -765,7 +811,7 @@ shotPopup.style.cssText = `
 document.getElementById('hud').appendChild(shotPopup);
 
 function showShotPopup(totalSpeed, maxHeightCm, flightLenCm, angle, spin) {
-    const v = new THREE.Vector3(ballPos[0], ballPos[1], ballPos[2]);
+    const v = new THREE.Vector3(ball.pos[0], ball.pos[1], ball.pos[2]);
     worldGroup.updateMatrixWorld();
     v.applyMatrix4(worldGroup.matrixWorld);
     v.project(camera);
@@ -774,12 +820,19 @@ function showShotPopup(totalSpeed, maxHeightCm, flightLenCm, angle, spin) {
 
     const angleStr = (angle >= 0 ? '+' : '') + angle + '°';
     const spinStr  = spin !== 0 ? spin.toFixed(2) : '0';
+    const muRoll   = stimpToMu(env.stimpM);
+    const terrH    = getTerrainHeight(ball.pos[0], ball.pos[2]);
+    const terrN    = getTerrainNormal(ball.pos[0], ball.pos[2]);
+    const slopeStr = `${terrN.x >= 0 ? '+' : ''}${terrN.x.toFixed(3)}, ${terrN.z >= 0 ? '+' : ''}${terrN.z.toFixed(3)}`;
     shotPopup.innerHTML =
         `speed: <span style="color:#ffe033">${totalSpeed.toFixed(2)} m/s</span><br>` +
         `height: <span style="color:#ffe033">${maxHeightCm.toFixed(1)} cm</span><br>` +
         `flight: <span style="color:#ffe033">${flightLenCm.toFixed(1)} cm</span><br>` +
         `angle: <span style="color:#ffe033">${angleStr}</span><br>` +
-        `spin: <span style="color:#ffe033">${spinStr}</span>`;
+        `spin: <span style="color:#ffe033">${spinStr}</span><br>` +
+        `µ: <span style="color:#88ff88">${muRoll.toFixed(4)}</span>  ` +
+        `h: <span style="color:#88ff88">${(terrH * 1000).toFixed(1)} mm</span><br>` +
+        `slope nx,nz: <span style="color:#88ff88">${slopeStr}</span>`;
     shotPopup.style.left = sx + 'px';
     shotPopup.style.top  = sy + 'px';
     shotPopup.style.display = 'block';
@@ -789,12 +842,14 @@ document.addEventListener('pointerdown', () => { shotPopup.style.display = 'none
 document.addEventListener('touchstart',  () => { shotPopup.style.display = 'none'; }, { passive: true });
 
 // ===================================================================
+// FLIGHT POPUP — side-view of ball launch trajectory (bottom-right)
+// ===================================================================
 // SHOT AIM POINT MARKERS
 // ===================================================================
 const aimPtGroup = new THREE.Group();
 worldGroup.add(aimPtGroup);
 const aimPtGeo = new THREE.SphereGeometry(BALL_RADIUS_M * 1.0, 8, 8);
-const aimPtMatYellow = new THREE.MeshBasicMaterial({ color: 0xf0d259 });
+
 const aimPtMatBlue = new THREE.MeshBasicMaterial({ color: 0x1a7ae6 });
 
 function addAimPointMarker(pt) {
@@ -872,80 +927,7 @@ function placeGhostCross(x, z) {
     }
 }
 
-function simulateGhostRest(startPos, startVel, startSpin) {
-    // Continue ball physics ignoring the hole until ball stops.
-    const simDt = 1 / 120;
-    let px = startPos[0], py = startPos[1], pz = startPos[2];
-    let vx = startVel[0], vy = startVel[1], vz = startVel[2];
-    let spin = startSpin;
-    let airborne = false;
-    const angleRad = angleDeg * Math.PI / 180;
-    const muRoll = stimpToMu(stimpM);
-
-    for (let step = 0; step < 20000; step++) {
-        const speed = Math.hypot(vx, vz);
-        if (speed < 0.02 && !airborne) break;
-
-        // Ground check (no hole)
-        const terrainH = getTerrainHeight(px, pz);
-        const heightAbove = py - BALL_RADIUS_M - terrainH;
-        airborne = heightAbove > LANDING_THRESHOLD;
-
-        let ax = 0, ay = -GRAVITY, az = 0;
-
-        if (!airborne) {
-            az += GRAVITY * Math.sin(angleRad) * ROLLING_FACTOR;
-            if (speed > 1e-4) {
-                const normal = getTerrainNormal(px, pz);
-                let friction = muRoll * GRAVITY * Math.abs(normal.y);
-                let spinMod = 1.0 + spin * SPIN_EFFECT_STRENGTH;
-                spinMod = Math.max(0.5, Math.min(1.5, spinMod));
-                ax -= friction * spinMod * (vx / speed);
-                az -= friction * spinMod * (vz / speed);
-                ax += normal.x * GRAVITY * ROLLING_FACTOR;
-                az += normal.z * GRAVITY * ROLLING_FACTOR;
-            }
-            spin *= Math.exp(-SPIN_DECAY_RATE * simDt);
-            if (Math.abs(spin) < 0.01) spin = 0;
-            const tr = trueRollAccel(px, pz, vx, vz);
-            ax += tr.ax;
-            az += tr.az;
-            ay = 0;
-            vy = 0;
-        } else {
-            az += GRAVITY * Math.sin(angleRad);
-        }
-
-        vx += ax * simDt;
-        vy += ay * simDt;
-        vz += az * simDt;
-        let nx = px + vx * simDt;
-        let ny = py + vy * simDt;
-        let nz = pz + vz * simDt;
-
-        // Floor
-        const minY = getTerrainHeight(nx, nz) + BALL_RADIUS_M;
-        if (ny < minY) {
-            if (airborne && Math.abs(vy) > MIN_BOUNCE_VEL) {
-                vy = -vy * BOUNCE_DAMPING;
-                vx *= BOUNCE_FRICTION;
-                vz *= BOUNCE_FRICTION;
-                ny = minY;
-            } else {
-                ny = minY;
-                vy = 0;
-                airborne = false;
-            }
-        }
-
-        px = nx; py = ny; pz = nz;
-
-        // Safety: stop if off green (organic SDF boundary)
-        if (greenSignedDistance(px, pz) > 0) break;
-    }
-
-    return { x: px, z: pz };
-}
+// simulateGhostRest → moved to physics.js
 
 // ===================================================================
 // HINT SYSTEM — solve & display ideal trajectory in Game mode
@@ -955,151 +937,7 @@ worldGroup.add(hintGroup);
 let hintUsedThisHole = false;
 const hintBtn = document.getElementById('hint-btn');
 
-/**
- * Simulate a putt and record the path.
- * Includes lip gravity (unlike simulateGhostRest).
- * Returns { path: [[x,y,z],...], hitHole, holeSpeed }.
- */
-function simulateTrajectory(startPos, vel) {
-    const simDt = 1 / 120;
-    let px = startPos[0], py = startPos[1], pz = startPos[2];
-    let vx = vel[0], vy = 0, vz = vel[1];
-    let spin = 0;
-    let airborne = false;
-    const angleRad = angleDeg * Math.PI / 180;
-    const muRoll = stimpToMu(stimpM);
-    const path = [[px, py, pz]];
-    let hitHole = false;
-    let holeSpeed = Infinity;
-    let minDistToHole = Infinity;
-    const recordEvery = 4; // record every N steps
-
-    for (let step = 0; step < 20000; step++) {
-        const speed = Math.hypot(vx, vz);
-        if (speed < 0.02 && !airborne) break;
-
-        const terrainH = getTerrainHeight(px, pz);
-        const heightAbove = py - BALL_RADIUS_M - terrainH;
-        airborne = heightAbove > LANDING_THRESHOLD;
-
-        let ax = 0, ay = -GRAVITY, az = 0;
-
-        if (!airborne) {
-            az += GRAVITY * Math.sin(angleRad) * ROLLING_FACTOR;
-            if (speed > 1e-4) {
-                const normal = getTerrainNormal(px, pz);
-                let friction = muRoll * GRAVITY * Math.abs(normal.y);
-                let spinMod = 1.0 + spin * SPIN_EFFECT_STRENGTH;
-                spinMod = Math.max(0.5, Math.min(1.5, spinMod));
-                ax -= friction * spinMod * (vx / speed);
-                az -= friction * spinMod * (vz / speed);
-                ax += normal.x * GRAVITY * ROLLING_FACTOR;
-                az += normal.z * GRAVITY * ROLLING_FACTOR;
-            }
-            spin *= Math.exp(-SPIN_DECAY_RATE * simDt);
-            if (Math.abs(spin) < 0.01) spin = 0;
-            const tr = trueRollAccel(px, pz, vx, vz);
-            ax += tr.ax;
-            az += tr.az;
-
-            // Lip gravity
-            const lipOuter = HOLE_RADIUS_M * 2.3;
-            const dh = Math.hypot(px, pz);
-            if (dh > 0.001 && dh < lipOuter) {
-                const t = 1.0 - dh / lipOuter;
-                const lipForce = GRAVITY * 2.5 * t * t;
-                ax += -px / dh * lipForce;
-                az += -pz / dh * lipForce;
-            }
-
-            ay = 0;
-            vy = 0;
-        } else {
-            az += GRAVITY * Math.sin(angleRad);
-        }
-
-        vx += ax * simDt;
-        vy += ay * simDt;
-        vz += az * simDt;
-        let nx = px + vx * simDt;
-        let ny = py + vy * simDt;
-        let nz = pz + vz * simDt;
-
-        const minY = getTerrainHeight(nx, nz) + BALL_RADIUS_M;
-        if (ny < minY) {
-            ny = minY; vy = 0; airborne = false;
-        }
-        px = nx; py = ny; pz = nz;
-
-        // Record path
-        if (step % recordEvery === 0) path.push([px, py, pz]);
-
-        // Check hole
-        const distH = Math.hypot(px, pz);
-        if (distH < minDistToHole) minDistToHole = distH;
-        if (distH <= HOLE_RADIUS_M + BALL_RADIUS_M * 0.5) {
-            hitHole = true;
-            holeSpeed = speed;
-            path.push([px, py, pz]);
-            break;
-        }
-
-        if (greenSignedDistance(px, pz) > 0) break;
-    }
-
-    return { path, hitHole, holeSpeed, minDistToHole };
-}
-
-/**
- * Search over angles and speeds to find the trajectory that enters the hole
- * with the lowest speed (most likely to drop in).
- */
-function solveHintTrajectory() {
-    const bx = ballPos[0], bz = ballPos[2], by = ballPos[1];
-    let bestPath = null;
-    let bestSpeed = Infinity;
-
-    for (let deg = 0; deg < 360; deg += 1) {
-        const rad = deg * Math.PI / 180;
-        const dx = Math.cos(rad), dz = Math.sin(rad);
-
-        // Binary search on aim distance (0.3m to 6m)
-        let lo = 0.3, hi = 6.0;
-        let found = false;
-        let foundPath = null;
-        let foundSpeed = Infinity;
-
-        for (let iter = 0; iter < 18; iter++) {
-            const mid = (lo + hi) / 2;
-            const speedH = STIMP_V0 * Math.sqrt(mid / stimpM);
-            const result = simulateTrajectory(
-                [bx, by, bz],
-                [speedH * dx, speedH * dz]
-            );
-            if (result.hitHole) {
-                hi = mid; // try slower
-                found = true;
-                foundPath = result.path;
-                foundSpeed = result.holeSpeed;
-            } else {
-                // Ball missed — use closest approach to decide
-                // If ball got close but passed, it was too fast; otherwise too slow
-                if (result.minDistToHole < HOLE_RADIUS_M * 4) {
-                    hi = mid; // overshot — reduce speed
-                } else {
-                    lo = mid; // undershot — increase speed
-                }
-            }
-        }
-
-        if (found && foundSpeed < bestSpeed) {
-            bestSpeed = foundSpeed;
-            bestPath = foundPath;
-        }
-    }
-
-    return bestPath;
-}
+// simulateTrajectory, solveHintTrajectory → moved to physics.js
 
 function clearHint() {
     while (hintGroup.children.length) {
@@ -1114,7 +952,7 @@ function showHint() {
     if (hintUsedThisHole) return;
     clearHint();
 
-    const path = solveHintTrajectory();
+    const path = solveHintTrajectory({ ballPos: ball.pos, angleDeg: env.angleDeg, stimpM: env.stimpM, holeX, holeZ });
     if (!path || path.length < 2) return;
 
     // Build a CatmullRomCurve3 through the path points
@@ -1312,12 +1150,12 @@ function rebuildGoodAimZone() {
                 ax1, getTerrainHeight(ax1, az1) + yOff + 0.002, az1,
                 ax2, getTerrainHeight(ax2, az2) + yOff + 0.002, az2
             ];
-            const aimLineGeo = new THREE.BufferGeometry();
-            aimLineGeo.setAttribute('position', new THREE.Float32BufferAttribute(aimLineVerts, 3));
-            const aimLineMat = new THREE.LineBasicMaterial({
+            const aimLineGeoLocal = new THREE.BufferGeometry();
+            aimLineGeoLocal.setAttribute('position', new THREE.Float32BufferAttribute(aimLineVerts, 3));
+            const aimLineMatLocal = new THREE.LineBasicMaterial({
                 color: 0xf0e020, depthTest: false, transparent: true, opacity: 0.7
             });
-            const aimLineMesh = new THREE.Line(aimLineGeo, aimLineMat);
+            const aimLineMesh = new THREE.Line(aimLineGeoLocal, aimLineMatLocal);
             aimLineMesh.renderOrder = 998;
             goodAimGroup.add(aimLineMesh);
 
@@ -1339,7 +1177,7 @@ function rebuildGoodAimZone() {
             // Aim left of hole → ball breaks left to right; aim right → right to left
             const lr = Math.abs(ell.cx) < 0.001 ? 'Straight' : (ell.cx < 0 ? 'Left to Right' : 'Right to Left');
             // Up/Down: compare effective elevation at ball vs hole
-            const angleRad = angleDeg * Math.PI / 180;
+            const angleRad = env.angleDeg * Math.PI / 180;
             const heightBall = getTerrainHeight(sx, sz) - sz * Math.sin(angleRad);
             const heightHole = getTerrainHeight(0, 0);
             const heightDiff = heightHole - heightBall;
@@ -1365,7 +1203,7 @@ function rebuildBreakMarkers() {
     while (breakGroup.children.length) breakGroup.remove(breakGroup.children[0]);
     const geo = new THREE.SphereGeometry(BALL_RADIUS_M * 1.5, 8, 8);
     const mat = new THREE.MeshBasicMaterial({ color: 0xff6600 });
-    for (const [pos] of breakPoints) {
+    for (const [pos] of ball.breakPoints) {
         const mesh = new THREE.Mesh(geo, mat);
         const y = getTerrainHeight(pos[0], pos[1]) + 0.01;
         mesh.position.set(pos[0], y, pos[1]);
@@ -1414,7 +1252,7 @@ function buildContourVis() {
                 if (h < hMin) hMin = h;
                 if (h > hMax) hMax = h;
             }
-            const g = getGradientAt(x, z, angleDeg);
+            const g = getGradientAt(x, z, env.angleDeg);
             const m = Math.hypot(g.gx, g.gz);
             gradMag[idx] = m;
             if (m > gMax && greenSignedDistance(x, z) < -0.1) gMax = m;
@@ -1433,7 +1271,7 @@ function buildContourVis() {
             const z0 = -halfWorld + iz * sp;
             const cx = x0 + sp * 0.5, cz = z0 + sp * 0.5;
             if (greenSignedDistance(cx, cz) > -0.1) continue;
-            if (Math.hypot(cx, cz) < HOLE_RADIUS_M + 0.02) continue;
+            if (distToHole(cx, cz) < HOLE_RADIUS_M + 0.02) continue;
 
             // 4 corners: (ix,iz), (ix+1,iz), (ix,iz+1), (ix+1,iz+1)
             const corners = [
@@ -1559,6 +1397,60 @@ function buildContourVis() {
     }
 }
 
+// ===================================================================
+// NORMALS HELPER — visualise HEIGHT_GRID normals as line segments
+// ===================================================================
+let normalsHelper = null;
+
+function buildNormalsHelper() {
+    if (normalsHelper) {
+        worldGroup.remove(normalsHelper);
+        normalsHelper.geometry.dispose();
+        normalsHelper.material.dispose();
+        normalsHelper = null;
+    }
+
+    const step   = 2;                       // sample every N grid cells
+    const len    = 0.25;                    // arrow length in world units
+    const half   = TR_WORLD_SIZE / 2;
+    const gstep  = TR_WORLD_SIZE / (TR_GRID_SIZE - 1);
+    const pts    = [];
+
+    for (let iz = 0; iz < TR_GRID_SIZE; iz += step) {
+        for (let ix = 0; ix < TR_GRID_SIZE; ix += step) {
+            const wx = -half + ix * gstep;
+            const wz = -half + iz * gstep;
+            const wy = getTerrainHeight(wx, wz);
+            const n  = getTerrainNormal(wx, wz);
+            pts.push(wx,       wy,       wz);
+            pts.push(wx + n.x * len, wy + n.y * len, wz + n.z * len);
+        }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    const mat = new THREE.LineBasicMaterial({ color: 0x00ffff, depthTest: false, transparent: true, opacity: 0.7 });
+    normalsHelper = new THREE.LineSegments(geo, mat);
+    normalsHelper.renderOrder = 10;
+    worldGroup.add(normalsHelper);
+}
+
+function toggleNormalsHelper() {
+    viz.normalsVisible = !viz.normalsVisible;
+    if (viz.normalsVisible) {
+        buildNormalsHelper();
+    } else if (normalsHelper) {
+        worldGroup.remove(normalsHelper);
+        normalsHelper.geometry.dispose();
+        normalsHelper.material.dispose();
+        normalsHelper = null;
+    }
+}
+
+function refreshNormalsIfVisible() {
+    if (viz.normalsVisible) buildNormalsHelper();
+}
+
 function buildGradientArrows() {
     while (gradientGroup.children.length) {
         const c = gradientGroup.children[0];
@@ -1577,9 +1469,9 @@ function buildGradientArrows() {
     for (let x = -halfWorld + spacing; x < halfWorld; x += spacing) {
         for (let z = -halfWorld + spacing; z < halfWorld; z += spacing) {
             if (greenSignedDistance(x, z) > -0.3) continue; // only inside green
-            if (Math.hypot(x, z) < HOLE_RADIUS_M * 3) continue;
+            if (distToHole(x, z) < HOLE_RADIUS_M * 3) continue;
 
-            const { gx, gz } = getGradientAt(x, z, angleDeg);
+            const { gx, gz } = getGradientAt(x, z, env.angleDeg);
             const mag = Math.hypot(gx, gz);
             if (mag < 0.01) continue;
 
@@ -1623,7 +1515,6 @@ function buildGradientArrows() {
 }
 
 let gradientLastAngle = 0;
-let gradientDirty = true;
 
 // ===================================================================
 // STREAMLINES & FLOW PARTICLES (F key toggle)
@@ -1645,14 +1536,14 @@ function traceStreamline(startX, startZ) {
     const minSpSq = 0.0009; // 0.03^2
 
     for (let i = 0; i < 2000; i++) {
-        const g = getGradientAt(x, z, angleDeg);
+        const g = getGradientAt(x, z, env.angleDeg);
         const mag = Math.hypot(g.gx, g.gz);
         if (mag < 0.003) break;
         // Step along gradient direction (pure fall-line)
         x += (g.gx / mag) * stepSize;
         z += (g.gz / mag) * stepSize;
         if (greenSignedDistance(x, z) > -0.1) break;
-        if (Math.hypot(x, z) < HOLE_RADIUS_M * 1.5) { points.push([x, z]); break; }
+        if (distToHole(x, z) < HOLE_RADIUS_M * 1.5) { points.push([x, z]); break; }
         const last = points[points.length - 1];
         const ddx = x - last[0], ddz = z - last[1];
         if (ddx * ddx + ddz * ddz >= minSpSq) points.push([x, z]);
@@ -1725,8 +1616,8 @@ function rebuildFlowVisuals() {
         flowGroup.add(flowPointsObj);
     }
 
-    flowLastAngle = angleDeg;
-    flowLastStimp = stimpM;
+    flowLastAngle = env.angleDeg;
+    flowLastStimp = env.stimpM;
 }
 
 function updateFlowParticles(dt) {
@@ -1741,7 +1632,7 @@ function updateFlowParticles(dt) {
         const idx = Math.floor(p[1]) % lineLen;
         const [px, pz] = line[idx];
 
-        const g = getGradientAt(px, pz, angleDeg);
+        const g = getGradientAt(px, pz, env.angleDeg);
         const mag = Math.hypot(g.gx, g.gz);
         const speed = 4.0 + 8.0 * Math.min(mag, 3.0);
         p[1] += speed * dt;
@@ -1784,7 +1675,7 @@ let gridFlowLastStimp = STIMP_DEFAULT;
 
 // Pick the neighboring grid intersection most aligned with the gradient
 function pickGridTarget(x, z, sp) {
-    const g = getGradientAt(x, z, angleDeg);
+    const g = getGradientAt(x, z, env.angleDeg);
     const mag = Math.hypot(g.gx, g.gz);
     if (mag < 0.01) return null; // no meaningful slope
 
@@ -1892,8 +1783,8 @@ function rebuildGridFlow() {
         gridFlowGroup.add(gridFlowPointsObj);
     }
 
-    gridFlowLastAngle = angleDeg;
-    gridFlowLastStimp = stimpM;
+    gridFlowLastAngle = env.angleDeg;
+    gridFlowLastStimp = env.stimpM;
 }
 
 function updateGridFlowParticles(dt) {
@@ -1909,7 +1800,7 @@ function updateGridFlowParticles(dt) {
         const p = gridFlowParticles[i];
 
         // Speed based on gradient magnitude at spawn point
-        const g = getGradientAt(p.spawnX, p.spawnZ, angleDeg);
+        const g = getGradientAt(p.spawnX, p.spawnZ, env.angleDeg);
         const mag = Math.hypot(g.gx, g.gz);
         const speed = baseSpeed + gradScale * Math.min(mag, 3.0);
 
@@ -1953,14 +1844,14 @@ function rebuildSlopeIndicator() {
         slopeIndicatorGroup.remove(c);
         if (c.geometry) c.geometry.dispose();
     }
-    if (Math.abs(angleDeg) < 0.01) return;
+    if (Math.abs(env.angleDeg) < 0.01) return;
 
     const halfEst = greenBoundingRadius() * 0.5;
     const arrowX = -halfEst * 0.85;
     const yOff = 0.01;
-    const arrowLen = Math.max(0.3, Math.min(1.5, Math.abs(angleDeg) * 0.15));
+    const arrowLen = Math.max(0.3, Math.min(1.5, Math.abs(env.angleDeg) * 0.15));
     const headSize = 0.12;
-    const dir = angleDeg > 0 ? 1.0 : -1.0;
+    const dir = env.angleDeg > 0 ? 1.0 : -1.0;
     const startZ = -(arrowLen / 2) * dir;
     const endZ = (arrowLen / 2) * dir;
 
@@ -2012,7 +1903,7 @@ const guideEl = document.getElementById('guide');
 let guideTimer = null;
 
 function setGuide(text, duration) {
-    if (gameState) { guideEl.classList.remove('show'); return; }
+    if (gameCtx.state) { guideEl.classList.remove('show'); return; }
     if (!text) { guideEl.classList.remove('show'); return; }
     guideEl.textContent = text;
     guideEl.classList.add('show');
@@ -2028,35 +1919,35 @@ function clearGuide() { guideEl.classList.remove('show'); if (guideTimer) { clea
 
 function updateHUD() {
     const lines = [
-        `angle: ${angleDeg.toFixed(1)} deg`,
-        `stimp: ${stimpM.toFixed(1)} m`,
+        `angle: ${env.angleDeg.toFixed(1)} deg`,
+        `stimp: ${env.stimpM.toFixed(1)} m`,
         `true roll: ${getTrueRollStrength().toFixed(1)}`,
-        `start dist: ${ballCircleRadius.toFixed(1)} m`,
-        `launch angle: ${launchAngleDeg > 0 ? '+' : ''}${launchAngleDeg} deg`,
+        `start dist: ${ball.circleRadius.toFixed(1)} m`,
+        `launch angle: ${env.launchAngleDeg > 0 ? '+' : ''}${env.launchAngleDeg} deg`,
     ];
 
-    if (ballMoving) {
-        lines.push(`speed: ${Math.hypot(ballVel[0], ballVel[2]).toFixed(2)} m/s`);
+    if (ball.moving) {
+        lines.push(`speed: ${Math.hypot(ball.vel[0], ball.vel[2]).toFixed(2)} m/s`);
     } else {
         const aimDist = Math.max(
-            Math.hypot(aimWorld.x - ballPos[0], aimWorld.z - ballPos[2]), 0.1
+            Math.hypot(aimWorld.x - ball.pos[0], aimWorld.z - ball.pos[2]), 0.1
         );
-        const v0 = STIMP_V0 * Math.sqrt(aimDist / stimpM);
+        const v0 = STIMP_V0 * Math.sqrt(aimDist / env.stimpM);
         lines.push(`shot speed: ${v0.toFixed(2)} m/s`);
     }
 
-    lines.push(`distance: ${travelDist.toFixed(2)} m`);
-    lines.push(`to hole: ${Math.hypot(ballPos[0], ballPos[2]).toFixed(2)} m`);
-    lines.push(`height: ${ballPos[1].toFixed(3)} m`);
+    lines.push(`distance: ${ball.travelDist.toFixed(2)} m`);
+    lines.push(`to hole: ${distToHole(ball.pos[0], ball.pos[2]).toFixed(2)} m`);
+    lines.push(`height: ${ball.pos[1].toFixed(3)} m`);
 
-    if (ballMoving || maxHeight > BALL_RADIUS_M + 0.01) {
-        lines.push(`max height: ${maxHeight.toFixed(3)} m`);
-        lines.push(`bounces: ${bounceCount}`);
+    if (ball.moving || ball.maxHeight > BALL_RADIUS_M + 0.01) {
+        lines.push(`max height: ${ball.maxHeight.toFixed(3)} m`);
+        lines.push(`bounces: ${ball.bounceCount}`);
     }
 
     statsEl.textContent = lines.join('\n');
-    helpEl.style.display = showHelp ? '' : 'none';
-    if (messageEl) messageEl.style.display = inHole ? '' : 'none';
+    helpEl.style.display = viz.showHelp ? '' : 'none';
+    if (messageEl) messageEl.style.display = ball.inHole ? '' : 'none';
     syncSlidersFromState();
 }
 
@@ -2067,7 +1958,7 @@ const speedCanvas = document.getElementById('speed-chart');
 const speedCtx = speedCanvas.getContext('2d');
 
 function drawSpeedChart() {
-    if (!showSpeedChart) return;
+    if (!charts.showSpeed) return;
     const W = speedCanvas.width, H = speedCanvas.height;
     const pad = { l: 45, r: 15, t: 30, b: 30 };
     const cw = W - pad.l - pad.r, ch = H - pad.t - pad.b;
@@ -2078,13 +1969,13 @@ function drawSpeedChart() {
     speedCtx.fillStyle = 'rgba(10, 12, 16, 0.75)';
     speedCtx.fillRect(0, 0, W, H);
 
-    if (speedData.length < 4) return; // need at least 2 points (pairs of dist,speed)
+    if (charts.speedData.length < 4) return; // need at least 2 points (pairs of dist,speed)
 
     // Find ranges
     let maxDist = 0, maxSpeed = 0;
-    for (let i = 0; i < speedData.length; i += 2) {
-        if (speedData[i] > maxDist) maxDist = speedData[i];
-        if (speedData[i + 1] > maxSpeed) maxSpeed = speedData[i + 1];
+    for (let i = 0; i < charts.speedData.length; i += 2) {
+        if (charts.speedData[i] > maxDist) maxDist = charts.speedData[i];
+        if (charts.speedData[i + 1] > maxSpeed) maxSpeed = charts.speedData[i + 1];
     }
     if (maxDist < 0.01) maxDist = 1;
     if (maxSpeed < 0.01) maxSpeed = 1;
@@ -2144,9 +2035,9 @@ function drawSpeedChart() {
     speedCtx.strokeStyle = '#ffe033';
     speedCtx.lineWidth = 2;
     speedCtx.beginPath();
-    for (let i = 0; i < speedData.length; i += 2) {
-        const x = pad.l + (speedData[i] / maxDist) * cw;
-        const y = pad.t + ch - (speedData[i + 1] / maxSpeed) * ch;
+    for (let i = 0; i < charts.speedData.length; i += 2) {
+        const x = pad.l + (charts.speedData[i] / maxDist) * cw;
+        const y = pad.t + ch - (charts.speedData[i + 1] / maxSpeed) * ch;
         if (i === 0) speedCtx.moveTo(x, y);
         else speedCtx.lineTo(x, y);
     }
@@ -2154,9 +2045,9 @@ function drawSpeedChart() {
 }
 
 function toggleSpeedChart() {
-    showSpeedChart = !showSpeedChart;
-    speedCanvas.style.display = showSpeedChart ? 'block' : 'none';
-    if (!showSpeedChart) speedCtx.clearRect(0, 0, speedCanvas.width, speedCanvas.height);
+    charts.showSpeed = !charts.showSpeed;
+    speedCanvas.style.display = charts.showSpeed ? 'block' : 'none';
+    if (!charts.showSpeed) speedCtx.clearRect(0, 0, speedCanvas.width, speedCanvas.height);
 }
 
 // ===================================================================
@@ -2166,7 +2057,7 @@ const energyCanvas = document.getElementById('energy-chart');
 const energyCtx = energyCanvas.getContext('2d');
 
 function drawEnergyChart() {
-    if (!showEnergyChart) return;
+    if (!charts.showEnergy) return;
     const W = energyCanvas.width, H = energyCanvas.height;
     energyCtx.clearRect(0, 0, W, H);
 
@@ -2180,12 +2071,12 @@ function drawEnergyChart() {
 
     // Determine x range
     let maxDist = 0.5;
-    for (let i = 0; i < energyData.length; i += 2) {
-        if (energyData[i] > maxDist) maxDist = energyData[i];
+    for (let i = 0; i < charts.energyData.length; i += 2) {
+        if (charts.energyData[i] > maxDist) maxDist = charts.energyData[i];
     }
     // If we have launch params, extend range to where flat reference hits 0
-    if (launchV0sq > 0 && launchMu !== null) {
-        const flatStop = launchV0sq / (2 * launchMu * GRAVITY);
+    if (ball.launchV0sq > 0 && ball.launchMu !== null) {
+        const flatStop = ball.launchV0sq / (2 * ball.launchMu * GRAVITY);
         if (flatStop > maxDist) maxDist = flatStop;
     }
 
@@ -2248,7 +2139,7 @@ function drawEnergyChart() {
     energyCtx.restore();
 
     // Flat green reference curve (grey dotted)
-    if (launchV0sq > 0 && launchMu !== null) {
+    if (ball.launchV0sq > 0 && ball.launchMu !== null) {
         energyCtx.setLineDash([6, 4]);
         energyCtx.strokeStyle = 'rgba(180,180,180,0.7)';
         energyCtx.lineWidth = 1.5;
@@ -2257,7 +2148,7 @@ function drawEnergyChart() {
         let started = false;
         for (let s = 0; s <= steps; s++) {
             const d = (s / steps) * maxDist;
-            const keFlat = Math.max(0, 1 - (2 * launchMu * GRAVITY * d) / launchV0sq);
+            const keFlat = Math.max(0, 1 - (2 * ball.launchMu * GRAVITY * d) / ball.launchV0sq);
             const px = pad.l + (d / maxDist) * cw;
             const py = pad.t + ch - keFlat * ch;
             if (!started) { energyCtx.moveTo(px, py); started = true; }
@@ -2269,24 +2160,24 @@ function drawEnergyChart() {
     }
 
     // Actual KE curve (yellow fill + stroke)
-    if (energyData.length >= 4) {
+    if (charts.energyData.length >= 4) {
         // Build flat reference values at same x positions for fill
         energyCtx.beginPath();
         // Forward pass along actual curve
-        for (let i = 0; i < energyData.length; i += 2) {
-            const d = energyData[i];
-            const ke = energyData[i + 1];
+        for (let i = 0; i < charts.energyData.length; i += 2) {
+            const d = charts.energyData[i];
+            const ke = charts.energyData[i + 1];
             const px = pad.l + (d / maxDist) * cw;
             const py = pad.t + ch - ke * ch;
             if (i === 0) energyCtx.moveTo(px, py);
             else energyCtx.lineTo(px, py);
         }
         // Reverse pass along flat reference for fill
-        for (let i = energyData.length - 2; i >= 0; i -= 2) {
-            const d = energyData[i];
+        for (let i = charts.energyData.length - 2; i >= 0; i -= 2) {
+            const d = charts.energyData[i];
             let keFlat = 1;
-            if (launchV0sq > 0 && launchMu !== null) {
-                keFlat = Math.max(0, 1 - (2 * launchMu * GRAVITY * d) / launchV0sq);
+            if (ball.launchV0sq > 0 && ball.launchMu !== null) {
+                keFlat = Math.max(0, 1 - (2 * ball.launchMu * GRAVITY * d) / ball.launchV0sq);
             }
             const px = pad.l + (d / maxDist) * cw;
             const py = pad.t + ch - keFlat * ch;
@@ -2298,9 +2189,9 @@ function drawEnergyChart() {
 
         // Actual curve stroke
         energyCtx.beginPath();
-        for (let i = 0; i < energyData.length; i += 2) {
-            const d = energyData[i];
-            const ke = energyData[i + 1];
+        for (let i = 0; i < charts.energyData.length; i += 2) {
+            const d = charts.energyData[i];
+            const ke = charts.energyData[i + 1];
             const px = pad.l + (d / maxDist) * cw;
             const py = pad.t + ch - ke * ch;
             if (i === 0) energyCtx.moveTo(px, py);
@@ -2313,9 +2204,9 @@ function drawEnergyChart() {
 }
 
 function toggleEnergyChart() {
-    showEnergyChart = !showEnergyChart;
-    energyCanvas.style.display = showEnergyChart ? 'block' : 'none';
-    if (!showEnergyChart) energyCtx.clearRect(0, 0, energyCanvas.width, energyCanvas.height);
+    charts.showEnergy = !charts.showEnergy;
+    energyCanvas.style.display = charts.showEnergy ? 'block' : 'none';
+    if (!charts.showEnergy) energyCtx.clearRect(0, 0, energyCanvas.width, energyCanvas.height);
 }
 
 // ===================================================================
@@ -2323,12 +2214,9 @@ function toggleEnergyChart() {
 // ===================================================================
 const phaseCanvas = document.getElementById('phase-chart');
 const phaseCtx    = phaseCanvas.getContext('2d');
-let showPhaseChart = false;
-let phaseData      = [];   // [vx, vz, vx, vz, ...]  — recorded every 3rd frame
-let phaseV0        = 1;    // initial speed for axis scaling
 
 function drawPhaseChart() {
-    if (!showPhaseChart) return;
+    if (!charts.showPhase) return;
     const W = phaseCanvas.width, H = phaseCanvas.height;
     phaseCtx.clearRect(0, 0, W, H);
     phaseCtx.fillStyle = 'rgba(0,0,0,0.75)';
@@ -2338,7 +2226,7 @@ function drawPhaseChart() {
     const cw = W - pad.l - pad.r, ch = H - pad.t - pad.b;
     const cx = pad.l + cw / 2, cy = pad.t + ch / 2;
     const scale = Math.min(cw, ch) / 2;
-    const maxV  = Math.max(phaseV0 * 1.05, 0.01);
+    const maxV  = Math.max(charts.phaseV0 * 1.05, 0.01);
 
     // Grid
     phaseCtx.strokeStyle = 'rgba(255,255,255,0.08)';
@@ -2371,13 +2259,13 @@ function drawPhaseChart() {
     phaseCtx.fillStyle = '#ff4444';
     phaseCtx.beginPath(); phaseCtx.arc(cx, cy, 4, 0, Math.PI * 2); phaseCtx.fill();
 
-    if (phaseData.length < 4) return;
+    if (charts.phaseData.length < 4) return;
 
     // Trajectory — colour by speed magnitude
     phaseCtx.lineWidth = 1.8;
-    for (let i = 2; i < phaseData.length; i += 2) {
-        const vx0 = phaseData[i-2], vz0 = phaseData[i-1];
-        const vx1 = phaseData[i],   vz1 = phaseData[i+1];
+    for (let i = 2; i < charts.phaseData.length; i += 2) {
+        const vx0 = charts.phaseData[i-2], vz0 = charts.phaseData[i-1];
+        const vx1 = charts.phaseData[i],   vz1 = charts.phaseData[i+1];
         const ratio = Math.hypot(vx1, vz1) / maxV;
         const [r, g, b] = trailSpeedColor(Math.min(1, ratio));
         phaseCtx.strokeStyle = `rgb(${(r*255)|0},${(g*255)|0},${(b*255)|0})`;
@@ -2388,8 +2276,8 @@ function drawPhaseChart() {
     }
 
     // Current point
-    const n = phaseData.length;
-    const cvx = phaseData[n-2], cvz = phaseData[n-1];
+    const n = charts.phaseData.length;
+    const cvx = charts.phaseData[n-2], cvz = charts.phaseData[n-1];
     phaseCtx.fillStyle = '#fff';
     phaseCtx.beginPath();
     phaseCtx.arc(cx + (cvx / maxV) * scale, cy - (cvz / maxV) * scale, 3, 0, Math.PI*2);
@@ -2397,9 +2285,9 @@ function drawPhaseChart() {
 }
 
 function togglePhaseChart() {
-    showPhaseChart = !showPhaseChart;
-    phaseCanvas.style.display = showPhaseChart ? 'block' : 'none';
-    if (!showPhaseChart) phaseCtx.clearRect(0, 0, phaseCanvas.width, phaseCanvas.height);
+    charts.showPhase = !charts.showPhase;
+    phaseCanvas.style.display = charts.showPhase ? 'block' : 'none';
+    if (!charts.showPhase) phaseCtx.clearRect(0, 0, phaseCanvas.width, phaseCanvas.height);
 }
 
 
@@ -2423,6 +2311,7 @@ document.getElementById('metrics-toggle').addEventListener('click', () => {
 // ===================================================================
 // D-PAD
 // ===================================================================
+const keysHeld = {};
 const dpadEl = document.getElementById('dpad');
 const dpadMap = {
     'dpad-up':    'ArrowUp',
@@ -2441,75 +2330,75 @@ Object.entries(dpadMap).forEach(([id, key]) => {
 // Distance +/- buttons
 const dpadDistLabel = document.getElementById('dpad-dist-label');
 function updateDistLabel() {
-    dpadDistLabel.textContent = ballCircleRadius.toFixed(1);
+    dpadDistLabel.textContent = ball.circleRadius.toFixed(1);
 }
 document.getElementById('dpad-dist-minus').addEventListener('click', () => {
-    if (ballMoving || !ballOnCircle) return;
-    ballCircleRadius = Math.max(BALL_CIRCLE_MIN, ballCircleRadius - BALL_CIRCLE_STEP);
+    if (ball.moving || !ball.onCircle) return;
+    ball.circleRadius = Math.max(BALL_CIRCLE_MIN, ball.circleRadius - BALL_CIRCLE_STEP);
     updateBallOnCircle();
     updateDistLabel();
 });
 document.getElementById('dpad-dist-plus').addEventListener('click', () => {
-    if (ballMoving || !ballOnCircle) return;
-    ballCircleRadius = Math.min(BALL_CIRCLE_MAX, ballCircleRadius + BALL_CIRCLE_STEP);
+    if (ball.moving || !ball.onCircle) return;
+    ball.circleRadius = Math.min(BALL_CIRCLE_MAX, ball.circleRadius + BALL_CIRCLE_STEP);
     updateBallOnCircle();
     updateDistLabel();
 });
 
 function updateMetrics() {
     if (metricsPanel.classList.contains('collapsed')) return;
-    const dh = Math.hypot(ballPos[0], ballPos[2]);
+    const dh = distToHole(ball.pos[0], ball.pos[2]);
     mToHole.textContent = dh.toFixed(2) + ' m';
 
     // Initial speed
-    if (initialSpeed !== null) {
-        mInitSpeed.textContent = initialSpeed.toFixed(2) + ' m/s';
+    if (ball.initialSpeed !== null) {
+        mInitSpeed.textContent = ball.initialSpeed.toFixed(2) + ' m/s';
     }
 
     // Speed at hole
-    if (speedAtHole !== null) {
-        mSpeedHole.textContent = speedAtHole.toFixed(2) + ' m/s';
-    } else if (ballMoving) {
+    if (ball.speedAtHole !== null) {
+        mSpeedHole.textContent = ball.speedAtHole.toFixed(2) + ' m/s';
+    } else if (ball.moving) {
         mSpeedHole.textContent = '...';
     }
 
     // Final distance to hole (updated when stopped)
-    if (!ballMoving && travelDist > 0.01) {
+    if (!ball.moving && ball.travelDist > 0.01) {
         mFinalDist.textContent = dh.toFixed(2) + ' m';
-    } else if (ballMoving) {
+    } else if (ball.moving) {
         mFinalDist.textContent = '...';
     }
 
     // Max break
-    if (maxLateralDev > 0.001) {
+    if (ball.maxLateralDev > 0.001) {
         const ballDiam = 2 * BALL_RADIUS_M;
-        const nBalls = maxLateralDev / ballDiam;
-        mMaxBreak.textContent = nBalls.toFixed(1) + ' balls (' + (maxLateralDev * 100).toFixed(1) + ' cm)';
-    } else if (ballMoving) {
+        const nBalls = ball.maxLateralDev / ballDiam;
+        mMaxBreak.textContent = nBalls.toFixed(1) + ' balls (' + (ball.maxLateralDev * 100).toFixed(1) + ' cm)';
+    } else if (ball.moving) {
         mMaxBreak.textContent = '...';
     }
 
     // Break apex (% of total travel)
-    if (breakApexTravelDist > 0 && travelDist > 0.01) {
-        const pct = (breakApexTravelDist / travelDist) * 100;
-        mBreakApex.textContent = pct.toFixed(0) + '% (' + breakApexTravelDist.toFixed(2) + ' m)';
-    } else if (ballMoving) {
+    if (ball.breakApexTravelDist > 0 && ball.travelDist > 0.01) {
+        const pct = (ball.breakApexTravelDist / ball.travelDist) * 100;
+        mBreakApex.textContent = pct.toFixed(0) + '% (' + ball.breakApexTravelDist.toFixed(2) + ' m)';
+    } else if (ball.moving) {
         mBreakApex.textContent = '...';
     }
 
     // Line error at hole
-    if (lineErrorAtHole !== null) {
+    if (ball.lineErrorAtHole !== null) {
         const ballDiam = 2 * BALL_RADIUS_M;
-        const nBalls = lineErrorAtHole / ballDiam;
-        mLineError.textContent = nBalls.toFixed(1) + ' balls (' + (lineErrorAtHole * 100).toFixed(1) + ' cm)';
-    } else if (ballMoving) {
+        const nBalls = ball.lineErrorAtHole / ballDiam;
+        mLineError.textContent = nBalls.toFixed(1) + ' balls (' + (ball.lineErrorAtHole * 100).toFixed(1) + ' cm)';
+    } else if (ball.moving) {
         mLineError.textContent = '...';
     }
 
     // Entry angle
-    if (entryAngle !== null) {
-        mEntryAngle.textContent = entryAngle.toFixed(1) + '°';
-    } else if (ballMoving) {
+    if (ball.entryAngle !== null) {
+        mEntryAngle.textContent = ball.entryAngle.toFixed(1) + '°';
+    } else if (ball.moving) {
         mEntryAngle.textContent = '...';
     }
 }
@@ -2517,7 +2406,6 @@ function updateMetrics() {
 // ===================================================================
 // INPUT
 // ===================================================================
-const keysHeld = {};
 window.addEventListener('keydown', (e) => { keysHeld[e.key] = true; });
 window.addEventListener('keyup', (e) => { keysHeld[e.key] = false; });
 
@@ -2534,10 +2422,10 @@ window.addEventListener('keydown', (e) => {
 
     // Discrete key events
     // During game mode: allow shoot (space), camera (B, Z/U), help (H) only
-    if (e.key === ' ' && !ballMoving && !inHole) {
-        if (!gameState || gameState === 'putting') shoot();
+    if (e.key === ' ' && !ball.moving && !ball.inHole) {
+        if (!gameCtx.state || gameCtx.state === 'putting') shoot();
     }
-    if (e.key === 'h' || e.key === 'H') showHelp = !showHelp;
+    if (e.key === 'h' || e.key === 'H') viz.showHelp = !viz.showHelp;
     if (e.key === 'b' || e.key === 'B') resetCamera();
     if (e.key === 'z' || e.key === 'Z') {
         camera.fov = Math.max(ZOOM_MIN, camera.fov - ZOOM_STEP);
@@ -2550,20 +2438,20 @@ window.addEventListener('keydown', (e) => {
     // Allowed during game mode
     if (e.key === 'f' || e.key === 'F') cycleFlowMode();
     // Blocked during game mode
-    if (!gameState) {
-        if (e.key === 'x' || e.key === 'X') stimpM = Math.min(6.0, stimpM + 0.1);
-        if (e.key === 'y' || e.key === 'Y') stimpM = Math.max(1.0, stimpM - 0.1);
+    if (!gameCtx.state) {
+        if (e.key === 'x' || e.key === 'X') env.stimpM = Math.min(6.0, env.stimpM + 0.1);
+        if (e.key === 'y' || e.key === 'Y') env.stimpM = Math.max(1.0, env.stimpM - 0.1);
         if ((e.key === 'r' || e.key === 'R') && !e.repeat) resetBall(e.shiftKey);
-        if (e.key === '1' && !ballMoving && ballOnCircle) {
-            ballCircleRadius = Math.max(BALL_CIRCLE_MIN, ballCircleRadius - BALL_CIRCLE_STEP);
+        if (e.key === '1' && !ball.moving && ball.onCircle) {
+            ball.circleRadius = Math.max(BALL_CIRCLE_MIN, ball.circleRadius - BALL_CIRCLE_STEP);
             updateBallOnCircle(); updateDistLabel();
         }
-        if (e.key === '2' && !ballMoving && ballOnCircle) {
-            ballCircleRadius = Math.min(BALL_CIRCLE_MAX, ballCircleRadius + BALL_CIRCLE_STEP);
+        if (e.key === '2' && !ball.moving && ball.onCircle) {
+            ball.circleRadius = Math.min(BALL_CIRCLE_MAX, ball.circleRadius + BALL_CIRCLE_STEP);
             updateBallOnCircle(); updateDistLabel();
         }
-        if (e.key === '3') launchAngleDeg = Math.max(LAUNCH_ANGLE_MIN, launchAngleDeg - LAUNCH_ANGLE_STEP);
-        if (e.key === '4') launchAngleDeg = Math.min(LAUNCH_ANGLE_MAX, launchAngleDeg + LAUNCH_ANGLE_STEP);
+        if (e.key === '3') env.launchAngleDeg = Math.max(LAUNCH_ANGLE_MIN, env.launchAngleDeg - LAUNCH_ANGLE_STEP);
+        if (e.key === '4') env.launchAngleDeg = Math.min(LAUNCH_ANGLE_MAX, env.launchAngleDeg + LAUNCH_ANGLE_STEP);
     }
 });
 
@@ -2594,6 +2482,7 @@ let _mouseDownPos = null;
 let _mouseDownTime = 0;
 const CLICK_MAX_MOVE = 15;
 const CLICK_MAX_TIME = 300;
+let placingHole = false;
 
 renderer.domElement.addEventListener('mousedown', (e) => {
     highlightHelp(e.ctrlKey || e.metaKey ? 'ctrl+drag' : 'drag');
@@ -2606,28 +2495,33 @@ renderer.domElement.addEventListener('mouseup', (e) => {
     const dist = Math.hypot(e.clientX - _mouseDownPos.x, e.clientY - _mouseDownPos.y);
     const elapsed = performance.now() - _mouseDownTime;
     _mouseDownPos = null;
-    if (dist < CLICK_MAX_MOVE && elapsed < CLICK_MAX_TIME && !ballMoving && inHole) {
+    if (dist < CLICK_MAX_MOVE && elapsed < CLICK_MAX_TIME && !ball.moving && ball.inHole) {
         resetBall(false);
         return;
     }
-    if (dist < CLICK_MAX_MOVE && elapsed < CLICK_MAX_TIME && !ballMoving && !inHole) {
-        // Short click — set aimpoint via raycast
+    if (dist < CLICK_MAX_MOVE && elapsed < CLICK_MAX_TIME && !ball.moving) {
         const ndc = new THREE.Vector2(
             (e.clientX / window.innerWidth) * 2 - 1,
             -(e.clientY / window.innerHeight) * 2 + 1
         );
-        _raycaster.setFromCamera(ndc, camera);
-        _invMatrix.copy(worldGroup.matrixWorld).invert();
-        const origin = _raycaster.ray.origin.clone().applyMatrix4(_invMatrix);
-        const dir = _raycaster.ray.direction.clone().transformDirection(_invMatrix);
-        if (Math.abs(dir.y) > 1e-10) {
-            const t = -origin.y / dir.y;
-            if (t > 0) {
-                const ax = origin.x + t * dir.x;
-                const az = origin.z + t * dir.z;
-                aimWorld.set(ax, getTerrainHeight(ax, az), az);
+        // Place Hole mode (GLB only)
+        if (placingHole && glbCtx.mode) {
+            const pt = resolveAimPoint(ndc);
+            if (pt) {
+                setHolePosition(pt.x, pt.z);
+                placingHole = false;
+                document.getElementById('glb-place-hole').textContent = 'Place Hole';
+                document.getElementById('glb-place-hole').style.color = '';
+            }
+            return;
+        }
+        // Short click — set aimpoint via raycast
+        if (!ball.inHole) {
+            const pt = resolveAimPoint(ndc);
+            if (pt) {
+                aimWorld.set(pt.x, getTerrainHeight(pt.x, pt.z), pt.z);
                 aimLocked = true;
-                aimDot.material.color.setHex(0xe61a1a); // red — new active aimpoint
+                aimDot.material.color.setHex(0xe61a1a);
                 clearHint();
                 showAimPopup(e.clientX, e.clientY);
                 setGuide(GUIDE.SHOOT, 3000);
@@ -2644,15 +2538,15 @@ renderer.domElement.addEventListener('wheel', () => {
 // SHARED ACTION HELPERS
 // ===================================================================
 function cycleFlowMode() {
-    flowMode = (flowMode + 1) % 5;
-    flowGroup.visible      = flowMode === 1;
-    gridFlowGroup.visible  = flowMode === 2;
-    gradientGroup.visible  = flowMode === 3;
-    contourGroup.visible   = flowMode === 4;
-    if (flowMode === 1 && flowStreamlines.length === 0) rebuildFlowVisuals();
-    if (flowMode === 2 && gridFlowParticles.length === 0) rebuildGridFlow();
-    if (flowMode === 3) { gradientDirty = false; buildGradientArrows(); }
-    if (flowMode === 4 && contourGroup.children.length === 0) buildContourVis();
+    viz.flowMode = (viz.flowMode + 1) % 5;
+    flowGroup.visible      = viz.flowMode === 1;
+    gridFlowGroup.visible  = viz.flowMode === 2;
+    gradientGroup.visible  = viz.flowMode === 3;
+    contourGroup.visible   = viz.flowMode === 4;
+    if (viz.flowMode === 1 && flowStreamlines.length === 0) rebuildFlowVisuals();
+    if (viz.flowMode === 2 && gridFlowParticles.length === 0) rebuildGridFlow();
+    if (viz.flowMode === 3) { buildGradientArrows(); }
+    if (viz.flowMode === 4 && contourGroup.children.length === 0) buildContourVis();
 }
 
 function resetCamera() {
@@ -2667,17 +2561,26 @@ function resetCamera() {
 // TOUCH UI — SLIDERS & BUTTONS
 // ===================================================================
 
-// ---- Side panel toggles ----
+// ---- Sidebar (N key + tab) ----
+const sidebar    = document.getElementById('sidebar');
+const sidebarTab = document.getElementById('sidebar-tab');
+sidebarTab.addEventListener('click', () => sidebar.classList.toggle('hidden'));
+document.addEventListener('keydown', (e) => {
+    if ((e.key === 'n' || e.key === 'N') && document.activeElement.tagName !== 'INPUT')
+        sidebar.classList.toggle('hidden');
+});
+
+// ---- Panel accordion ----
 for (const { panelId, toggleId } of [
     { panelId: 'panel-green',    toggleId: 'toggle-green'    },
     { panelId: 'panel-lighting', toggleId: 'toggle-lighting' },
+    { panelId: 'panel-glb',      toggleId: 'toggle-glb'      },
 ]) {
-    const panel  = document.getElementById(panelId);
-    const toggle = document.getElementById(toggleId);
-    toggle.addEventListener('click', () => {
-        panel.classList.toggle('collapsed');
-        toggle.querySelector('.panel-arr').textContent =
-            panel.classList.contains('collapsed') ? '\u00BB' : '\u00AB';
+    document.getElementById(toggleId).addEventListener('click', () => {
+        const panel  = document.getElementById(panelId);
+        const isOpen = panel.classList.contains('open');
+        document.querySelectorAll('.side-panel.open').forEach(p => p.classList.remove('open'));
+        if (!isOpen) panel.classList.add('open');
     });
 }
 
@@ -2697,66 +2600,66 @@ const valPos    = document.getElementById('val-pos');
 const valLaunch = document.getElementById('val-launch');
 
 slAngle.addEventListener('input', () => {
-    if (gameState) { syncSlidersFromState(); return; }
-    angleDeg = parseFloat(slAngle.value);
-    valAngle.textContent = angleDeg.toFixed(1);
+    if (gameCtx.state) { syncSlidersFromState(); return; }
+    env.angleDeg = parseFloat(slAngle.value);
+    valAngle.textContent = env.angleDeg.toFixed(1);
 });
 slStimp.addEventListener('input', () => {
-    if (gameState) { syncSlidersFromState(); return; }
-    stimpM = parseFloat(slStimp.value);
-    valStimp.textContent = stimpM.toFixed(1);
+    if (gameCtx.state) { syncSlidersFromState(); return; }
+    env.stimpM = parseFloat(slStimp.value);
+    valStimp.textContent = env.stimpM.toFixed(1);
 });
 slTroll.addEventListener('input', () => {
-    if (gameState) { syncSlidersFromState(); return; }
+    if (gameCtx.state) { syncSlidersFromState(); return; }
     setTrueRollStrength(parseFloat(slTroll.value));
     valTroll.textContent = getTrueRollStrength().toFixed(1);
 });
 slDist.addEventListener('input', () => {
-    if (gameState) { syncSlidersFromState(); return; }
-    if (ballMoving || !ballOnCircle) return;
-    ballCircleRadius = parseFloat(slDist.value);
-    valDist.textContent = ballCircleRadius.toFixed(1);
+    if (gameCtx.state) { syncSlidersFromState(); return; }
+    if (ball.moving || !ball.onCircle) return;
+    ball.circleRadius = parseFloat(slDist.value);
+    valDist.textContent = ball.circleRadius.toFixed(1);
     updateBallOnCircle();
 });
 slPos.addEventListener('input', () => {
-    if (gameState) { syncSlidersFromState(); return; }
-    if (ballMoving || !ballOnCircle) return;
-    ballAngle = parseFloat(slPos.value) * Math.PI / 180;
-    lastCircleAngle = ballAngle;
+    if (gameCtx.state) { syncSlidersFromState(); return; }
+    if (ball.moving || !ball.onCircle) return;
+    ball.angle = parseFloat(slPos.value) * Math.PI / 180;
+    ball.lastCircleAngle = ball.angle;
     valPos.textContent = Math.round(parseFloat(slPos.value));
     updateBallOnCircle();
 });
 slLaunch.addEventListener('input', () => {
-    if (gameState) { syncSlidersFromState(); return; }
-    launchAngleDeg = parseInt(slLaunch.value, 10);
-    valLaunch.textContent = launchAngleDeg;
+    if (gameCtx.state) { syncSlidersFromState(); return; }
+    env.launchAngleDeg = parseInt(slLaunch.value, 10);
+    valLaunch.textContent = env.launchAngleDeg;
 });
 
 // ---- Bidirectional sync: keyboard → sliders ----
 function syncSlidersFromState() {
-    slAngle.value  = angleDeg;
-    slStimp.value  = stimpM;
+    slAngle.value  = env.angleDeg;
+    slStimp.value  = env.stimpM;
     slTroll.value  = getTrueRollStrength();
-    slDist.value   = ballCircleRadius;
-    slPos.value    = Math.round(ballAngle * 180 / Math.PI) % 360;
-    slLaunch.value = launchAngleDeg;
-    valAngle.textContent  = angleDeg.toFixed(1);
-    valStimp.textContent  = stimpM.toFixed(1);
+    slDist.value   = ball.circleRadius;
+    slPos.value    = Math.round(ball.angle * 180 / Math.PI) % 360;
+    slLaunch.value = env.launchAngleDeg;
+    valAngle.textContent  = env.angleDeg.toFixed(1);
+    valStimp.textContent  = env.stimpM.toFixed(1);
     valTroll.textContent  = getTrueRollStrength().toFixed(1);
-    valDist.textContent   = ballCircleRadius.toFixed(1);
-    valPos.textContent    = Math.round(ballAngle * 180 / Math.PI) % 360;
-    valLaunch.textContent = launchAngleDeg;
+    valDist.textContent   = ball.circleRadius.toFixed(1);
+    valPos.textContent    = Math.round(ball.angle * 180 / Math.PI) % 360;
+    valLaunch.textContent = env.launchAngleDeg;
 }
 
 // ---- Action buttons ----
 document.getElementById('shoot-btn').addEventListener('click', (e) => {
     e.preventDefault();
-    if (!ballMoving && !inHole && (!gameState || gameState === 'putting')) shoot();
+    if (!ball.moving && !ball.inHole && (!gameCtx.state || gameCtx.state === 'putting')) shoot();
 });
 
 hintBtn.addEventListener('click', (e) => {
     e.preventDefault();
-    if (gameState === 'putting' && !hintUsedThisHole) showHint();
+    if (gameCtx.state === 'putting' && !hintUsedThisHole) showHint();
 });
 
 const flowBtn = document.getElementById('flow-btn');
@@ -2769,7 +2672,7 @@ document.getElementById('action-btns').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
     const action = btn.dataset.action;
-    if (gameState && action !== 'startGame' && action !== 'resetCam' && action !== 'cycleFlow') return;
+    if (gameCtx.state && action !== 'startGame' && action !== 'resetCam' && action !== 'cycleFlow') return;
     switch (action) {
         case 'reset':      resetBall(false); break;
         case 'newTerrain':  resetBall(true); break;
@@ -2778,9 +2681,322 @@ document.getElementById('action-btns').addEventListener('click', (e) => {
         case 'toggleSpeed':   toggleSpeedChart(); break;
         case 'toggleEnergy':  toggleEnergyChart(); break;
         case 'togglePhase':   togglePhaseChart();  break;
+        case 'toggleNormals': toggleNormalsHelper(); break;
 
         case 'startGame':     startGame(); break;
+        case 'loadGLBTerrain': document.getElementById('glb-terrain-input').click(); break;
     }
+});
+
+// ---- GLB position controls ----
+const glbPosPanel  = document.getElementById('panel-glb');
+const glbXSlider     = document.getElementById('glb-x');
+const glbYSlider     = document.getElementById('glb-y');
+const glbZSlider     = document.getElementById('glb-z');
+const glbScaleSlider = document.getElementById('glb-scale');
+const glbXVal        = document.getElementById('glb-x-val');
+const glbYVal        = document.getElementById('glb-y-val');
+const glbZVal        = document.getElementById('glb-z-val');
+const glbScaleVal    = document.getElementById('glb-scale-val');
+
+document.getElementById('glb-terrain-input').addEventListener('change', (e) => {
+    if (e.target.files[0]) loadGLBTerrain(e.target.files[0], glbCtx, {
+        worldGroup,
+        greenMesh,
+        onLoaded: (err) => {
+            if (err) return;
+            decorGroup.visible = false;
+            glbXSlider.value = 0; glbYSlider.value = 0; glbZSlider.value = 0;
+            glbXVal.textContent = '0.0'; glbYVal.textContent = '0.00'; glbZVal.textContent = '0.0';
+            glbScaleSlider.value = 1; glbScaleVal.textContent = '×1.00';
+            glbPosPanel.classList.remove('glb-hidden');
+            glbPosPanel.classList.add('open');
+        },
+    });
+    e.target.value = '';
+});
+
+// Scale — visual only while dragging
+function applyGLBScaleVisual() {
+    if (!glbCtx.sceneRoot) return;
+    const s = parseFloat(glbScaleSlider.value);
+    glbScaleVal.textContent = '×' + s.toFixed(2);
+    glbCtx.sceneRoot.scale.setScalar(s);
+}
+
+// Scale — rebuild HEIGHT_GRID on release
+function applyGLBScalePhysics() {
+    if (!glbCtx.sceneRoot) return;
+    applyGLBScaleVisual();
+    extractHeightGridFromGLB(glbCtx);
+    buildTrueRollGrids(null);
+    setHeightGrid(glbCtx.baseHeightGrid);
+    refreshNormalsIfVisible();
+    if (!ball.moving) {
+        const bx = ball.pos[0], bz = ball.pos[2];
+        ball.pos[1] = getTerrainHeight(bx, bz) + BALL_RADIUS_M;
+    }
+}
+
+// Visual-only update: move mesh instantly while dragging (no physics recalculation)
+function applyGLBOffsetVisual() {
+    if (!glbCtx.sceneRoot) return;
+    const x = parseFloat(glbXSlider.value);
+    const y = parseFloat(glbYSlider.value);
+    const z = parseFloat(glbZSlider.value);
+    glbXVal.textContent = x.toFixed(1);
+    glbYVal.textContent = y.toFixed(1);
+    glbZVal.textContent = z.toFixed(1);
+    glbCtx.sceneRoot.position.set(x, y, z);
+}
+
+// Physics update: recalculate HEIGHT_GRID on slider release
+function applyGLBOffsetPhysics() {
+    if (!glbCtx.sceneRoot) return;
+    applyGLBOffsetVisual();
+    extractHeightGridFromGLB(glbCtx);
+    buildTrueRollGrids(null);
+    setHeightGrid(glbCtx.baseHeightGrid);
+    refreshNormalsIfVisible();
+    if (!ball.moving) {
+        const bx = ball.pos[0], bz = ball.pos[2];
+        ball.pos[1] = getTerrainHeight(bx, bz) + BALL_RADIUS_M;
+    }
+}
+
+/**
+ * Calibrate GLB physics so the ball rolls the expected Stimpmeter distance
+ * on the flattest area of the terrain.
+ *
+ * Algorithm:
+ *   1. Find the flattest cell in HEIGHT_GRID (min gradient magnitude).
+ *   2. Run simulateGhostRest in +X and −X from that cell (angleDeg=0, stimpM=3).
+ *   3. Average the two distances → D_avg. Expected: 3.0 m.
+ *   4. k = 3.0 / D_avg.  Scale vertex Y and HEIGHT_GRID by k to enforce the contract.
+ */
+// State for the visual calibration animation (null = not running)
+let calibAnim = null;
+
+function calibrateGLB() {
+    if (!glbCtx.mode || !glbCtx.baseHeightGrid || !glbCtx.meshData.length) return;
+
+    const calibResultEl = document.getElementById('glb-calib-result');
+    const overlay = document.getElementById('calib-overlay');
+
+    // 1. Use the aimDot position chosen by the user as the calibration launch point
+    const flatX = aimWorld.x;
+    const flatZ = aimWorld.z;
+    if (greenSignedDistance(flatX, flatZ) > -0.3) {
+        calibResultEl.textContent = 'Erreur : placez le curseur sur le green';
+        return;
+    }
+    const flatY = getTerrainHeight(flatX, flatZ) + BALL_RADIUS_M;
+
+    // 2a. Visual trajectories — use actual game params so animation looks like a real shot
+    const visualCtx = { angleDeg: env.angleDeg, stimpM: env.stimpM, holeX: 999, holeZ: 999 };
+    const traj1 = simulateTrajectory([flatX, flatY, flatZ], [ STIMP_V0, 0], visualCtx);
+    const traj2 = simulateTrajectory([flatX, flatY, flatZ], [-STIMP_V0, 0], visualCtx);
+
+    if (traj1.path.length < 2 || traj2.path.length < 2) {
+        calibResultEl.textContent = 'Erreur : terrain trop pentu au point plat';
+        return;
+    }
+
+    // 2b. k-factor trajectories — force angleDeg:0 to isolate HEIGHT_GRID amplitude
+    //     (slope from world tilt would inflate dAvg and corrupt k)
+    const kCtx = { angleDeg: 0, stimpM: env.stimpM, holeX: 999, holeZ: 999 };
+    const kTraj1 = simulateTrajectory([flatX, flatY, flatZ], [ STIMP_V0, 0], kCtx);
+    const kTraj2 = simulateTrajectory([flatX, flatY, flatZ], [-STIMP_V0, 0], kCtx);
+    const kLast1 = kTraj1.path[kTraj1.path.length - 1];
+    const kLast2 = kTraj2.path[kTraj2.path.length - 1];
+    const kDAvg = (Math.hypot(kLast1[0] - flatX, kLast1[2] - flatZ)
+                 + Math.hypot(kLast2[0] - flatX, kLast2[2] - flatZ)) / 2;
+
+    // 3. Create marker mesh (orange sphere, slightly larger than ball)
+    if (calibAnim && calibAnim.markerMesh) worldGroup.remove(calibAnim.markerMesh);
+    const markerGeo = new THREE.SphereGeometry(BALL_RADIUS_M * 1.5, 12, 8);
+    const markerMat = new THREE.MeshPhongMaterial({ color: 0xff8800, emissive: 0x331100 });
+    const markerMesh = new THREE.Mesh(markerGeo, markerMat);
+    worldGroup.add(markerMesh);
+
+    // 4. Start animation state
+    calibAnim = {
+        paths:  [traj1.path, traj2.path],
+        phase:  0,         // 0 = rolling +X, 1 = rolling -X
+        frame:  0,
+        markerMesh,
+        flatX, flatY, flatZ,
+        kDAvg,             // pre-computed flat-simulation distance for k factor
+        d1: null, d2: null,
+    };
+
+    // 5. Show overlay
+    overlay.style.display = 'flex';
+    document.getElementById('calib-phase').textContent   = 'Calibrage  1/2 → +X';
+    document.getElementById('calib-speed').textContent   = 'Vitesse : — m/s';
+    document.getElementById('calib-dist').textContent    = 'Distance : 0.00 m';
+    document.getElementById('calib-summary').textContent = '';
+    calibResultEl.textContent = 'Calibrage en cours…';
+}
+
+/**
+ * Called every frame from animate() while calibAnim is active.
+ * Advances the marker ball one path-frame and updates the HUD.
+ * Each path frame = 4 simulation steps = 4/120 s ≈ 33 ms of sim time.
+ */
+function updateCalibAnim() {
+    const ca = calibAnim;
+    const path = ca.paths[ca.phase];
+    const nextFrame = Math.min(ca.frame + 1, path.length - 1);
+    ca.frame = nextFrame;
+
+    const pt = path[nextFrame];
+    ca.markerMesh.position.set(pt[0], pt[1], pt[2]);
+
+    // Instantaneous speed: distance between consecutive path frames / sim time per frame
+    let speed = 0;
+    if (nextFrame > 0) {
+        const prev = path[nextFrame - 1];
+        const dSeg = Math.hypot(pt[0] - prev[0], pt[1] - prev[1], pt[2] - prev[2]);
+        speed = dSeg / (4 / 120);  // 4 sim steps at 1/120 s each
+    }
+
+    const dist = Math.hypot(pt[0] - ca.flatX, pt[2] - ca.flatZ);
+    document.getElementById('calib-speed').textContent = `Vitesse : ${speed.toFixed(3)} m/s`;
+    document.getElementById('calib-dist').textContent  = `Distance : ${dist.toFixed(2)} m`;
+
+    // End of current path?
+    if (nextFrame >= path.length - 1) {
+        const last = path[path.length - 1];
+        const d = Math.hypot(last[0] - ca.flatX, last[2] - ca.flatZ);
+
+        if (ca.phase === 0) {
+            // Switch to second direction
+            ca.d1 = d;
+            ca.frame = 0;
+            ca.phase = 1;
+            document.getElementById('calib-phase').textContent = 'Calibrage  2/2 → −X';
+            document.getElementById('calib-summary').textContent = `D+X = ${d.toFixed(2)} m`;
+            ca.markerMesh.position.set(ca.flatX, ca.flatY, ca.flatZ);
+        } else {
+            // Both paths done — apply calibration factor
+            ca.d2 = d;
+            applyCalibFactor();
+        }
+    }
+}
+
+/**
+ * Called when both calibration paths have been animated.
+ * Computes k = 3.0 / D_avg and scales the GLB terrain accordingly.
+ */
+function applyCalibFactor() {
+    const ca = calibAnim;
+    // Use the flat-simulation distance (angleDeg:0) to isolate HEIGHT_GRID amplitude.
+    // ca.d1/d2 are the visual distances (informational only, may include slope effect).
+    const dAvg = ca.kDAvg;
+    const calibResultEl = document.getElementById('glb-calib-result');
+    const overlay = document.getElementById('calib-overlay');
+
+    // Clean up marker
+    worldGroup.remove(ca.markerMesh);
+    calibAnim = null;
+    overlay.style.display = 'none';
+
+    // Validate
+    if (dAvg < 0.05) {
+        calibResultEl.textContent = 'Erreur : terrain trop pentu au point plat';
+        return;
+    }
+    const k = env.stimpM / dAvg;
+    if (k < 0.05 || k > 20.0) {
+        calibResultEl.textContent = `Erreur : k=${k.toFixed(2)} hors limites`;
+        return;
+    }
+
+    // Scale vertex Y and baseY by k — keeps visual & physics height in sync
+    for (const { geometry, baseY } of glbCtx.meshData) {
+        const pos = geometry.attributes.position;
+        for (let i = 0; i < pos.count; i++) {
+            pos.setY(i, pos.getY(i) * k);
+            baseY[i] *= k;
+        }
+        pos.needsUpdate = true;
+        geometry.computeVertexNormals();
+    }
+
+    // Scale sceneRoot Y offset so extractHeightGridFromGLB stays consistent
+    if (glbCtx.sceneRoot) {
+        const newOffsetY = glbCtx.sceneRoot.position.y * k;
+        glbCtx.sceneRoot.position.y = newOffsetY;
+        const clampedY = Math.max(-2, Math.min(2, newOffsetY));
+        glbYSlider.value = clampedY;
+        glbYVal.textContent = clampedY.toFixed(2);
+    }
+
+    // Re-derive HEIGHT_GRID from the now-scaled vertices
+    extractHeightGridFromGLB(glbCtx);
+    buildTrueRollGrids(null);
+    setHeightGrid(glbCtx.baseHeightGrid);
+    refreshNormalsIfVisible();
+
+    // Reposition ball at new terrain height
+    if (!ball.moving) {
+        ball.pos[1] = getTerrainHeight(ball.pos[0], ball.pos[2]) + BALL_RADIUS_M;
+    }
+
+    calibResultEl.textContent = `k=${k.toFixed(2)}  D=${dAvg.toFixed(2)}m → ${env.stimpM.toFixed(1)}m`;
+    console.log(`[GLB calibration] kDAvg=${dAvg.toFixed(3)}m target=${env.stimpM.toFixed(1)}m k=${k.toFixed(4)}`);
+}
+
+glbXSlider.addEventListener('input',  applyGLBOffsetVisual);
+glbYSlider.addEventListener('input',  applyGLBOffsetVisual);
+glbZSlider.addEventListener('input',  applyGLBOffsetVisual);
+glbXSlider.addEventListener('change', applyGLBOffsetPhysics);
+glbYSlider.addEventListener('change', applyGLBOffsetPhysics);
+glbZSlider.addEventListener('change', applyGLBOffsetPhysics);
+glbScaleSlider.addEventListener('input',  applyGLBScaleVisual);
+glbScaleSlider.addEventListener('change', applyGLBScalePhysics);
+
+
+document.getElementById('glb-pos-reset').addEventListener('click', () => {
+    glbXSlider.value = 0; glbYSlider.value = 0; glbZSlider.value = 0;
+    glbScaleSlider.value = 1; glbScaleVal.textContent = '×1.00';
+    if (glbCtx.sceneRoot) glbCtx.sceneRoot.scale.setScalar(1);
+    applyGLBOffsetPhysics();
+});
+
+// Flip mesh vertices along Z, then re-derive HEIGHT_GRID from the updated mesh.
+// Keeps visual and physics in sync (HEIGHT_GRID always follows the visual).
+document.getElementById('glb-flip-z').addEventListener('click', () => {
+    if (!glbCtx.meshData.length) return;
+    for (const { geometry } of glbCtx.meshData) {
+        const pos = geometry.attributes.position;
+        for (let i = 0; i < pos.count; i++) pos.setZ(i, -pos.getZ(i));
+        pos.needsUpdate = true;
+        geometry.computeVertexNormals();
+    }
+    extractHeightGridFromGLB(glbCtx);
+    buildTrueRollGrids(null);
+    setHeightGrid(glbCtx.baseHeightGrid);
+    refreshNormalsIfVisible();
+    if (!ball.moving) ball.pos[1] = getTerrainHeight(ball.pos[0], ball.pos[2]) + BALL_RADIUS_M;
+});
+
+// Flip mesh vertices along X, then re-derive HEIGHT_GRID.
+document.getElementById('glb-flip-x').addEventListener('click', () => {
+    if (!glbCtx.meshData.length) return;
+    for (const { geometry } of glbCtx.meshData) {
+        const pos = geometry.attributes.position;
+        for (let i = 0; i < pos.count; i++) pos.setX(i, -pos.getX(i));
+        pos.needsUpdate = true;
+        geometry.computeVertexNormals();
+    }
+    extractHeightGridFromGLB(glbCtx);
+    buildTrueRollGrids(null);
+    setHeightGrid(glbCtx.baseHeightGrid);
+    refreshNormalsIfVisible();
+    if (!ball.moving) ball.pos[1] = getTerrainHeight(ball.pos[0], ball.pos[2]) + BALL_RADIUS_M;
 });
 
 // ---- OrbitControls safety guard for slider interaction ----
@@ -2846,28 +3062,33 @@ renderer.domElement.addEventListener('touchend', (e) => {
     const dist = Math.hypot(t.clientX - _touchStartPos.x, t.clientY - _touchStartPos.y);
     const elapsed = performance.now() - _touchStartTime;
     _touchStartPos = null;
-    if (dist < TAP_MAX_MOVE && elapsed < TAP_MAX_TIME && !ballMoving && inHole) {
+    if (dist < TAP_MAX_MOVE && elapsed < TAP_MAX_TIME && !ball.moving && ball.inHole) {
         resetBall(false);
         return;
     }
-    if (dist < TAP_MAX_MOVE && elapsed < TAP_MAX_TIME && !ballMoving && !inHole) {
-        // Short tap — set aimpoint via raycast
+    if (dist < TAP_MAX_MOVE && elapsed < TAP_MAX_TIME && !ball.moving) {
         const ndc = new THREE.Vector2(
             (t.clientX / window.innerWidth) * 2 - 1,
             -(t.clientY / window.innerHeight) * 2 + 1
         );
-        _raycaster.setFromCamera(ndc, camera);
-        _invMatrix.copy(worldGroup.matrixWorld).invert();
-        const origin = _raycaster.ray.origin.clone().applyMatrix4(_invMatrix);
-        const dir = _raycaster.ray.direction.clone().transformDirection(_invMatrix);
-        if (Math.abs(dir.y) > 1e-10) {
-            const tt = -origin.y / dir.y;
-            if (tt > 0) {
-                const ax = origin.x + tt * dir.x;
-                const az = origin.z + tt * dir.z;
-                aimWorld.set(ax, getTerrainHeight(ax, az), az);
+        // Place Hole mode (GLB only)
+        if (placingHole && glbCtx.mode) {
+            const pt = resolveAimPoint(ndc);
+            if (pt) {
+                setHolePosition(pt.x, pt.z);
+                placingHole = false;
+                document.getElementById('glb-place-hole').textContent = 'Place Hole';
+                document.getElementById('glb-place-hole').style.color = '';
+            }
+            return;
+        }
+        // Short tap — set aimpoint via raycast
+        if (!ball.inHole) {
+            const pt = resolveAimPoint(ndc);
+            if (pt) {
+                aimWorld.set(pt.x, getTerrainHeight(pt.x, pt.z), pt.z);
                 aimLocked = true;
-                aimDot.material.color.setHex(0xe61a1a); // red — new active aimpoint
+                aimDot.material.color.setHex(0xe61a1a);
                 clearHint();
                 showAimPopup(t.clientX, t.clientY);
                 setGuide(GUIDE.SHOOT, 3000);
@@ -2891,21 +3112,21 @@ const gameExitLiveEl = document.getElementById('game-exit-live');
 function updateScorecard() {
     let html = '';
     for (let i = 0; i < 9; i++) {
-        const isCurrent = i === gameHoleIndex && gameState !== 'gameover';
-        const isFuture = i > gameHoleIndex || (i === gameHoleIndex && (gameState === 'putting' || gameState === 'moving' || gameState === 'setup'));
+        const isCurrent = i === gameCtx.holeIndex && gameCtx.state !== 'gameover';
+        const isFuture = i > gameCtx.holeIndex || (i === gameCtx.holeIndex && (gameCtx.state === 'putting' || gameCtx.state === 'moving' || gameCtx.state === 'setup'));
         const cls = isCurrent ? ' current' : (isFuture ? ' future' : '');
-        const pts = i < gameHoleScores.length ? gameHoleScores[i] : '-';
+        const pts = i < gameCtx.scores.length ? gameCtx.scores[i] : '-';
         html += `<div class="sc-hole${cls}"><span class="sc-num">${i + 1}</span><span class="sc-pts">${pts}</span></div>`;
     }
-    html += `<div class="sc-total"><span class="sc-num">TOT</span><span class="sc-pts">${gameScore}</span></div>`;
+    html += `<div class="sc-total"><span class="sc-num">TOT</span><span class="sc-pts">${gameCtx.score}</span></div>`;
     scorecardEl.innerHTML = html;
 }
 
 function startGame() {
-    gameState = 'setup';
-    gameHoleIndex = 0;
-    gameScore = 0;
-    gameHoleScores = [];
+    gameCtx.state = 'setup';
+    gameCtx.holeIndex = 0;
+    gameCtx.score = 0;
+    gameCtx.scores = [];
     // Hide free-play UI (keep stats visible)
     clearGuide();
     helpEl.style.display = 'none';
@@ -2926,11 +3147,11 @@ function startGame() {
 function setupHole(index) {
     const hole = GAME_HOLES[index];
     // Set parameters
-    angleDeg = hole.slope;
-    stimpM = hole.stimp;
+    env.angleDeg = hole.slope;
+    env.stimpM = hole.stimp;
     setTrueRollStrength(hole.trueRoll);
-    ballCircleRadius = hole.distance;
-    launchAngleDeg = 0; // pure roll in game mode
+    ball.circleRadius = hole.distance;
+    env.launchAngleDeg = 0; // pure roll in game mode
 
     // Rebuild terrain with specific seed
     clearAllTrails();
@@ -2945,19 +3166,19 @@ function setupHole(index) {
     rebuildSlopeIndicator();
 
     // Random ball angle
-    ballAngle = Math.random() * Math.PI * 2;
-    lastCircleAngle = ballAngle;
+    ball.angle = Math.random() * Math.PI * 2;
+    ball.lastCircleAngle = ball.angle;
     updateBallOnCircle();
-    ballMoving = false;
-    ballOnCircle = true;
-    ballAirborne = false;
-    inHole = false;
+    ball.moving = false;
+    ball.onCircle = true;
+    ball.airborne = false;
+    ball.inHole = false;
 
     // Save start position for later
-    gameStartPos = { x: ballPos[0], z: ballPos[2] };
+    gameCtx.startPos = { x: ball.pos[0], z: ball.pos[2] };
 
     // Hide all visual aids
-    flowMode = 0;
+    viz.flowMode = 0;
     flowGroup.visible = false;
     gridFlowGroup.visible = false;
     gradientGroup.visible = false;
@@ -2967,8 +3188,8 @@ function setupHole(index) {
     // Reset camera
     resetCamera();
 
-    gameCrossedHole = false;
-    gameState = 'putting';
+    gameCtx.crossedHole = false;
+    gameCtx.state = 'putting';
 
     // Reset hint for this hole
     clearHint();
@@ -2981,7 +3202,7 @@ function setupHole(index) {
 }
 
 function scoreShot(oob, tooFast = false) {
-    const distToHole = Math.hypot(ballPos[0], ballPos[2]);
+    const dth = distToHole(ball.pos[0], ball.pos[2]);
     const ballDiam = 2 * BALL_RADIUS_M;
     let pts = 0;
     let label = '';
@@ -2992,16 +3213,16 @@ function scoreShot(oob, tooFast = false) {
     } else if (tooFast) {
         pts = 5;
         label = 'Ball too fast! +5';
-    } else if (inHole) {
+    } else if (ball.inHole) {
         pts = 10;
         label = 'IN THE HOLE! +10';
-    } else if (gameCrossedHole) {
+    } else if (gameCtx.crossedHole) {
         pts = 5;
         label = 'Lip out! +5';
-    } else if (distToHole <= ballDiam) {
+    } else if (dth <= ballDiam) {
         pts = 3;
         label = 'Close! +3';
-    } else if (distToHole <= ballDiam * 3) {
+    } else if (dth <= ballDiam * 3) {
         pts = 1;
         label = 'Near +1';
     } else {
@@ -3009,8 +3230,8 @@ function scoreShot(oob, tooFast = false) {
         label = 'Miss +0';
     }
 
-    gameScore += pts;
-    gameHoleScores.push(pts);
+    gameCtx.score += pts;
+    gameCtx.scores.push(pts);
     updateScorecard();
 
     // Show score popup
@@ -3019,15 +3240,15 @@ function scoreShot(oob, tooFast = false) {
     void scorePopupEl.offsetWidth; // force reflow to restart animation
     scorePopupEl.classList.add('show');
 
-    gameState = 'reveal';
+    gameCtx.state = 'reveal';
 
     // Auto-advance after 3 seconds
     setTimeout(() => {
-        if (gameState !== 'reveal') return; // guard against double-fire
+        if (gameCtx.state !== 'reveal') return; // guard against double-fire
         scorePopupEl.classList.remove('show');
-        if (gameHoleIndex < 8) {
-            gameHoleIndex++;
-            setupHole(gameHoleIndex);
+        if (gameCtx.holeIndex < 8) {
+            gameCtx.holeIndex++;
+            setupHole(gameCtx.holeIndex);
         } else {
             endGame();
         }
@@ -3035,7 +3256,7 @@ function scoreShot(oob, tooFast = false) {
 }
 
 function endGame() {
-    gameState = 'gameover';
+    gameCtx.state = 'gameover';
     gameHudEl.style.display = 'none';
     gameExitLiveEl.style.display = 'none';
     hintBtn.style.display = 'none';
@@ -3043,19 +3264,19 @@ function endGame() {
     clearHint();
 
     let grade;
-    if (gameScore >= 81) grade = 'GOAT';
-    else if (gameScore >= 61) grade = 'Tour Pro';
-    else if (gameScore >= 41) grade = 'Scratch Golfer';
-    else if (gameScore >= 21) grade = 'Club Player';
+    if (gameCtx.score >= 81) grade = 'GOAT';
+    else if (gameCtx.score >= 61) grade = 'Tour Pro';
+    else if (gameCtx.score >= 41) grade = 'Scratch Golfer';
+    else if (gameCtx.score >= 21) grade = 'Club Player';
     else grade = 'Amateur';
 
-    gameFinalScoreEl.textContent = `${gameScore} / 90`;
+    gameFinalScoreEl.textContent = `${gameCtx.score} / 90`;
     gameGradeEl.textContent = grade;
     gameOverEl.classList.add('show');
 }
 
 function exitGame() {
-    gameState = null;
+    gameCtx.state = null;
     gameOverEl.classList.remove('show');
     gameHudEl.style.display = 'none';
     gameExitLiveEl.style.display = 'none';
@@ -3070,12 +3291,12 @@ function exitGame() {
     document.getElementById('action-btns').style.display = '';
     dpadEl.style.display = '';
     // Reset to defaults
-    angleDeg = 0;
-    stimpM = STIMP_DEFAULT;
+    env.angleDeg = 0;
+    env.stimpM = STIMP_DEFAULT;
     setTrueRollStrength(1.0);
-    ballCircleRadius = BALL_CIRCLE_RADIUS_DEFAULT;
+    ball.circleRadius = BALL_CIRCLE_RADIUS_DEFAULT;
     updateDistLabel();
-    launchAngleDeg = LAUNCH_ANGLE_DEFAULT;
+    env.launchAngleDeg = LAUNCH_ANGLE_DEFAULT;
     resetBall(true);
     resetCamera();
 }
@@ -3089,8 +3310,8 @@ gameExitLiveEl.addEventListener('click', () => exitGame());
 // ACTIONS
 // ===================================================================
 function shoot() {
-    const dirX = aimWorld.x - ballPos[0];
-    const dirZ = aimWorld.z - ballPos[2];
+    const dirX = aimWorld.x - ball.pos[0];
+    const dirZ = aimWorld.z - ball.pos[2];
     const len = Math.hypot(dirX, dirZ);
     if (len < 1e-6) return;
 
@@ -3098,89 +3319,90 @@ function shoot() {
     aimDot.material.color.setHex(0xf0d259);
     clearHint();
     clearGuide();
-    speedData = [];
-    speedSampleCounter = 0;
-    energyData = [];
-    phaseData  = [];
-    speedAtHole = null;
-    maxLateralDev = 0;
-    breakApexTravelDist = 0;
-    lineErrorAtHole = null;
-    entryAngle = null;
-    initialSpeed = null;
-    metricsShotStart = { x: ballPos[0], z: ballPos[2] };
-    closestHoleDist = Infinity;
-    prevHoleDist = Infinity;
+    charts.speedData = [];
+    charts.speedSampleCounter = 0;
+    charts.energyData = [];
+    charts.phaseData  = [];
+    ball.speedAtHole = null;
+    ball.maxLateralDev = 0;
+    ball.breakApexTravelDist = 0;
+    ball.lineErrorAtHole = null;
+    ball.entryAngle = null;
+    ball.initialSpeed = null;
+    ball.metricsShotStart = { x: ball.pos[0], z: ball.pos[2] };
+    ball.closestHoleDist = Infinity;
+    ball.prevHoleDist = Infinity;
 
-    lastShotStartPos = { x: ballPos[0], z: ballPos[2] };
+    lastShotStartPos = { x: ball.pos[0], z: ball.pos[2] };
 
-    const speedH = STIMP_V0 * Math.sqrt(len / stimpM);
+    const speedH = STIMP_V0 * Math.sqrt(len / env.stimpM);
     const dxn = dirX / len, dzn = dirZ / len;
-    const launchRad = launchAngleDeg * Math.PI / 180;
+    const launchRad = env.launchAngleDeg * Math.PI / 180;
     const totalSpeed = speedH / Math.cos(launchRad);
 
-    ballVel[0] = speedH * dxn;
-    ballVel[1] = totalSpeed * Math.sin(launchRad);
-    ballVel[2] = speedH * dzn;
-    initialSpeed = speedH;
-    phaseV0    = speedH;
-    launchV0sq = speedH * speedH;
-    launchMu = stimpToMu(stimpM);
+    ball.vel[0] = speedH * dxn;
+    ball.vel[1] = totalSpeed * Math.sin(launchRad);
+    ball.vel[2] = speedH * dzn;
+    ball.initialSpeed = speedH;
+    charts.phaseV0    = speedH;
+    ball.launchV0sq = speedH * speedH;
+    ball.launchMu = stimpToMu(env.stimpM);
 
-    ballMoving = true;
-    ballOnCircle = false;
-    ballAirborne = launchAngleDeg !== 0;
-    inHole = false;
-    bounceCount = 0;
-    maxHeight = ballPos[1];
-    ballSpin = launchAngleDeg / 15.0;
-    travelDist = 0.0;
+    ball.moving = true;
+    ball.onCircle = false;
+    ball.airborne = env.launchAngleDeg !== 0;
+    ball.inHole = false;
+    ball.bounceCount = 0;
+    ball.maxHeight = ball.pos[1];
+    ball.spin = env.launchAngleDeg / 15.0;
+    ball.travelDist = 0.0;
 
-    const maxHeightCm  = ballVel[1] > 0 ? (ballVel[1] * ballVel[1]) / (2 * GRAVITY) * 100 : 0;
-    const flightLenCm  = ballVel[1] > 0 ? (speedH * ballVel[1] / GRAVITY) * 100 : 0;
-    showShotPopup(totalSpeed, maxHeightCm, flightLenCm, launchAngleDeg, ballSpin);
+    const maxHeightCm  = ball.vel[1] > 0 ? (ball.vel[1] * ball.vel[1]) / (2 * GRAVITY) * 100 : 0;
+    const flightLenCm  = ball.vel[1] > 0 ? (speedH * ball.vel[1] / GRAVITY) * 100 : 0;
+    showShotPopup(totalSpeed, maxHeightCm, flightLenCm, env.launchAngleDeg, ball.spin);
+
 
     // Game mode: transition to 'moving'
-    if (gameState === 'putting') {
-        gameState = 'moving';
-        gameCrossedHole = false;
+    if (gameCtx.state === 'putting') {
+        gameCtx.state = 'moving';
+        gameCtx.crossedHole = false;
     }
 
     // Ensure first trail point
     if (!currentTrailLine || currentTrailLine.count === 0) {
-        addTrailPoint(ballPos[0], ballPos[1], ballPos[2]);
+        addTrailPoint(ball.pos[0], ball.pos[1], ball.pos[2]);
     }
 
     shotAimPoints.push(aimWorld.clone());
     addAimPointMarker(aimWorld);
 
-    breakPoints = [];
-    breakLocked = false;
-    prevVz = null;
-    prevPosForVz = [ballPos[0], ballPos[2]];
+    ball.breakPoints = [];
+    ball.breakLocked = false;
+    ball.prevVz = null;
+    ball.prevPosForVz = [ball.pos[0], ball.pos[2]];
     rebuildBreakMarkers();
 }
 
 function resetBall(newTerrain) {
-    ballAngle = lastCircleAngle;
-    const bx = ballCircleRadius * Math.cos(ballAngle);
-    const bz = ballCircleRadius * Math.sin(ballAngle);
+    ball.angle = ball.lastCircleAngle;
+    const bx = holeX + ball.circleRadius * Math.cos(ball.angle);
+    const bz = holeZ + ball.circleRadius * Math.sin(ball.angle);
     const by = getTerrainHeight(bx, bz) + BALL_RADIUS_M;
-    ballPos = [bx, by, bz];
-    ballVel = [0, 0, 0];
-    ballMoving = false;
-    ballOnCircle = true;
-    ballAirborne = false;
+    ball.pos = [bx, by, bz];
+    ball.vel = [0, 0, 0];
+    ball.moving = false;
+    ball.onCircle = true;
+    ball.airborne = false;
     aimLocked = false;
     aimDot.material.color.setHex(0xe61a1a); // red — no aimpoint chosen yet
-    inHole = false;
-    bounceCount = 0;
-    maxHeight = 0.0;
-    breakPoints = [];
-    breakLocked = false;
-    prevVz = null;
-    ballSpin = 0.0;
-    travelDist = 0.0;
+    ball.inHole = false;
+    ball.bounceCount = 0;
+    ball.maxHeight = 0.0;
+    ball.breakPoints = [];
+    ball.breakLocked = false;
+    ball.prevVz = null;
+    ball.spin = 0.0;
+    ball.travelDist = 0.0;
     ballMesh.quaternion.identity();
     clearGhostMarker();
 
@@ -3188,76 +3410,88 @@ function resetBall(newTerrain) {
         clearAllTrails();
         shotAimPoints = [];
         clearAimPointMarkers();
-        generateShapeSeeds();
-        buildTrueRollGrids(null);
-        worldGroup.remove(greenMesh);
-        greenMesh.geometry.dispose();
-        greenMesh = buildGreenMesh();
-        worldGroup.add(greenMesh);
-        if (flowMode === 3) buildGradientArrows();
-        if (flowMode === 4) buildContourVis();
-        if (flowMode === 1) rebuildFlowVisuals();
-        if (flowMode === 2) rebuildGridFlow();
+        if (glbCtx.mode) {
+            applyGLBHeightVariation(glbCtx);
+        } else {
+            decorGroup.visible = true;
+            generateShapeSeeds();
+            buildTrueRollGrids(null);
+            worldGroup.remove(greenMesh);
+            greenMesh.geometry.dispose();
+            greenMesh = buildGreenMesh();
+            worldGroup.add(greenMesh);
+        }
+        if (viz.flowMode === 3) buildGradientArrows();
+        if (viz.flowMode === 4) buildContourVis();
+        if (viz.flowMode === 1) rebuildFlowVisuals();
+        if (viz.flowMode === 2) rebuildGridFlow();
         rebuildSlopeIndicator();
     } else {
         startNewTrailSegment();
     }
     rebuildBreakMarkers();
-    if (!gameState) setGuide(GUIDE.AIM);
+    if (!gameCtx.state) setGuide(GUIDE.AIM);
 }
 
 function updateBallOnCircle() {
-    const bx = ballCircleRadius * Math.cos(ballAngle);
-    const bz = ballCircleRadius * Math.sin(ballAngle);
+    const bx = holeX + ball.circleRadius * Math.cos(ball.angle);
+    const bz = holeZ + ball.circleRadius * Math.sin(ball.angle);
     const by = getTerrainHeight(bx, bz) + BALL_RADIUS_M;
-    ballPos = [bx, by, bz];
-
+    ball.pos = [bx, by, bz];
 }
 
 // ===================================================================
 // PHYSICS
 // ===================================================================
 function updatePhysics(dt) {
-    if (!ballMoving) return;
+    if (!ball.moving) return;
 
-    const angleRad = angleDeg * Math.PI / 180;
-    const muRoll = stimpToMu(stimpM);
+    // Sub-step at 1/120 s to match simulateTrajectory's fixed step — identical integration
+    const SIM_DT = 1 / 120;
+    const nSteps = Math.max(1, Math.round(dt / SIM_DT));
+    const subDt  = dt / nSteps;
+
+    for (let _s = 0; _s < nSteps; _s++) {
+    if (!ball.moving) break;
+
+    const angleRad = env.angleDeg * Math.PI / 180;
+    const muRoll = stimpToMu(env.stimpM);
     const holeDepth = 0.40;
 
     // Check if over the hole
-    const distToHoleCur = Math.hypot(ballPos[0], ballPos[2]);
+    const distToHoleCur = distToHole(ball.pos[0], ball.pos[2]);
     const overHole = distToHoleCur <= HOLE_RADIUS_M + BALL_RADIUS_M * 0.5;
 
     let groundLevel;
     if (overHole) {
-        const sxz = Math.hypot(ballVel[0], ballVel[2]);
-        const below = ballPos[1] < BALL_RADIUS_M * 0.5;
-        groundLevel = (sxz < 1.45 || below) ? -holeDepth : getTerrainHeight(ballPos[0], ballPos[2]);
+        const sxz = Math.hypot(ball.vel[0], ball.vel[2]);
+        const below = ball.pos[1] < BALL_RADIUS_M * 0.5;
+        groundLevel = (sxz < 1.45 || below) ? -holeDepth : getTerrainHeight(ball.pos[0], ball.pos[2]);
     } else {
-        groundLevel = getTerrainHeight(ballPos[0], ballPos[2]);
+        groundLevel = getTerrainHeight(ball.pos[0], ball.pos[2]);
     }
 
-    const heightAbove = ballPos[1] - BALL_RADIUS_M - groundLevel;
-    ballAirborne = heightAbove > LANDING_THRESHOLD;
+    const heightAbove = ball.pos[1] - BALL_RADIUS_M - groundLevel;
+    ball.airborne = heightAbove > LANDING_THRESHOLD;
 
     let ax = 0, ay = -GRAVITY, az = 0;
 
-    if (!ballAirborne) {
-        const speed = Math.hypot(ballVel[0], ballVel[2]);
+    if (!ball.airborne) {
+        const speed = Math.hypot(ball.vel[0], ball.vel[2]);
 
         // Global slope
         az += GRAVITY * Math.sin(angleRad) * ROLLING_FACTOR;
 
         if (speed > 1e-4) {
-            const normal = getTerrainNormal(ballPos[0], ballPos[2]);
+            const normal = getTerrainNormal(ball.pos[0], ball.pos[2]);
             let friction = muRoll * GRAVITY * Math.abs(normal.y);
 
             // Spin effect
-            let spinMod = 1.0 + ballSpin * SPIN_EFFECT_STRENGTH;
+            let spinMod = 1.0 + ball.spin * SPIN_EFFECT_STRENGTH;
             spinMod = Math.max(0.5, Math.min(1.5, spinMod));
 
-            ax -= friction * spinMod * (ballVel[0] / speed);
-            az -= friction * spinMod * (ballVel[2] / speed);
+            ax -= friction * spinMod * (ball.vel[0] / speed);
+            az -= friction * spinMod * (ball.vel[2] / speed);
 
             // Local terrain slope
             ax += normal.x * GRAVITY * ROLLING_FACTOR;
@@ -3265,102 +3499,102 @@ function updatePhysics(dt) {
         }
 
         // Spin decay
-        ballSpin *= Math.exp(-SPIN_DECAY_RATE * dt);
-        if (Math.abs(ballSpin) < 0.01) ballSpin = 0;
+        ball.spin *= Math.exp(-SPIN_DECAY_RATE * subDt);
+        if (Math.abs(ball.spin) < 0.01) ball.spin = 0;
 
         // True roll
-        const tr = trueRollAccel(ballPos[0], ballPos[2], ballVel[0], ballVel[2]);
+        const tr = trueRollAccel(ball.pos[0], ball.pos[2], ball.vel[0], ball.vel[2]);
         ax += tr.ax;
         az += tr.az;
 
         // Lip gravity — radial force toward hole center when ball is on the lip
         {
             const lipOuter = HOLE_RADIUS_M * 2.3;  // influence zone ~2.3× hole radius
-            const dh = Math.hypot(ballPos[0], ballPos[2]);
+            const dh = distToHole(ball.pos[0], ball.pos[2]);
             if (dh > 0.001 && dh < lipOuter) {
                 // Force ramps up as ball approaches hole edge, peaks at rim
                 const t = 1.0 - dh / lipOuter;  // 0 at outer edge, ~1 at center
                 const lipForce = GRAVITY * 2.5 * t * t;  // quadratic ramp
-                ax += -ballPos[0] / dh * lipForce;
-                az += -ballPos[2] / dh * lipForce;
+                ax += -(ball.pos[0] - holeX) / dh * lipForce;
+                az += -(ball.pos[2] - holeZ) / dh * lipForce;
             }
         }
 
         ay = 0;
-        ballVel[1] = 0;
+        ball.vel[1] = 0;
     } else {
         // Airborne — full gravity + global slope on Z
         az += GRAVITY * Math.sin(angleRad);
     }
 
     // Integrate velocity
-    ballVel[0] += ax * dt;
-    ballVel[1] += ay * dt;
-    ballVel[2] += az * dt;
+    ball.vel[0] += ax * subDt;
+    ball.vel[1] += ay * subDt;
+    ball.vel[2] += az * subDt;
 
-    let newX = ballPos[0] + ballVel[0] * dt;
-    let newY = ballPos[1] + ballVel[1] * dt;
-    let newZ = ballPos[2] + ballVel[2] * dt;
+    let newX = ball.pos[0] + ball.vel[0] * subDt;
+    let newY = ball.pos[1] + ball.vel[1] * subDt;
+    let newZ = ball.pos[2] + ball.vel[2] * subDt;
 
-    if (newY > maxHeight) maxHeight = newY;
+    if (newY > ball.maxHeight) ball.maxHeight = newY;
 
     // Floor check
-    const dhn = Math.hypot(newX, newZ);
+    const dhn = distToHole(newX, newZ);
     let minBallY;
     if (dhn <= HOLE_RADIUS_M + BALL_RADIUS_M * 0.5) {
-        const sxzf = Math.hypot(ballVel[0], ballVel[2]);
-        const belowf = ballPos[1] < BALL_RADIUS_M * 0.5;
+        const sxzf = Math.hypot(ball.vel[0], ball.vel[2]);
+        const belowf = ball.pos[1] < BALL_RADIUS_M * 0.5;
         minBallY = (sxzf < 1.45 || belowf) ? -holeDepth + BALL_RADIUS_M : getTerrainHeight(newX, newZ) + BALL_RADIUS_M;
     } else {
         minBallY = getTerrainHeight(newX, newZ) + BALL_RADIUS_M;
     }
 
     if (newY < minBallY) {
-        if (ballAirborne && Math.abs(ballVel[1]) > MIN_BOUNCE_VEL) {
-            bounceCount++;
-            ballVel[1] = -ballVel[1] * BOUNCE_DAMPING;
-            ballVel[0] *= BOUNCE_FRICTION;
-            ballVel[2] *= BOUNCE_FRICTION;
+        if (ball.airborne && Math.abs(ball.vel[1]) > MIN_BOUNCE_VEL) {
+            ball.bounceCount++;
+            ball.vel[1] = -ball.vel[1] * BOUNCE_DAMPING;
+            ball.vel[0] *= BOUNCE_FRICTION;
+            ball.vel[2] *= BOUNCE_FRICTION;
             newY = minBallY;
         } else {
             newY = minBallY;
-            ballVel[1] = 0;
-            ballAirborne = false;
+            ball.vel[1] = 0;
+            ball.airborne = false;
         }
     }
 
-    const distMoved = Math.hypot(newX - ballPos[0], newZ - ballPos[2]);
-    travelDist += distMoved;
+    const distMoved = Math.hypot(newX - ball.pos[0], newZ - ball.pos[2]);
+    ball.travelDist += distMoved;
 
     // Record speed / energy data for charts (always, so charts work when opened after shot)
-    speedSampleCounter++;
-    if (speedSampleCounter % 3 === 0) {
-        const spd = Math.hypot(ballVel[0], ballVel[2]);
-        speedData.push(travelDist, spd);
-        if (launchV0sq > 0) {
-            energyData.push(travelDist, (spd * spd) / launchV0sq);
+    charts.speedSampleCounter++;
+    if (charts.speedSampleCounter % 3 === 0) {
+        const spd = Math.hypot(ball.vel[0], ball.vel[2]);
+        charts.speedData.push(ball.travelDist, spd);
+        if (ball.launchV0sq > 0) {
+            charts.energyData.push(ball.travelDist, (spd * spd) / ball.launchV0sq);
         }
-        phaseData.push(ballVel[0], ballVel[2]);
+        charts.phaseData.push(ball.vel[0], ball.vel[2]);
     }
 
     // Metrics: speed at hole passage + lateral deviation + entry angle + line error
-    if (metricsShotStart) {
-        const dh = Math.hypot(newX, newZ);
-        const curSpeed = Math.hypot(ballVel[0], ballVel[2]);
+    if (ball.metricsShotStart) {
+        const dh = distToHole(newX, newZ);
+        const curSpeed = Math.hypot(ball.vel[0], ball.vel[2]);
 
         // Speed + line error + entry angle at closest approach to hole
-        if (dh < closestHoleDist) {
-            closestHoleDist = dh;
-        } else if (prevHoleDist <= closestHoleDist + 0.005 && speedAtHole === null) {
+        if (dh < ball.closestHoleDist) {
+            ball.closestHoleDist = dh;
+        } else if (ball.prevHoleDist <= ball.closestHoleDist + 0.005 && ball.speedAtHole === null) {
             // Ball just started moving away from hole → record metrics at passage
-            speedAtHole = curSpeed;
+            ball.speedAtHole = curSpeed;
 
             // Line error: perpendicular distance from hole to trajectory at passage point
-            const sx = metricsShotStart.x, sz = metricsShotStart.z;
+            const sx = ball.metricsShotStart.x, sz = ball.metricsShotStart.z;
             const lx = -sx, lz = -sz;
             const ll = Math.hypot(lx, lz);
             if (ll > 0.01) {
-                lineErrorAtHole = Math.abs(newX * lz - newZ * lx) / ll;
+                ball.lineErrorAtHole = Math.abs(newX * lz - newZ * lx) / ll;
             }
 
             // Entry angle: angle between ball velocity and line ball→hole
@@ -3368,29 +3602,29 @@ function updatePhysics(dt) {
                 const toHoleX = -newX, toHoleZ = -newZ;
                 const toHoleLen = Math.hypot(toHoleX, toHoleZ);
                 if (toHoleLen > 0.001) {
-                    const dot = (ballVel[0] * toHoleX + ballVel[2] * toHoleZ) / (curSpeed * toHoleLen);
-                    entryAngle = Math.acos(Math.min(1, Math.abs(dot))) * 180 / Math.PI;
+                    const dot = (ball.vel[0] * toHoleX + ball.vel[2] * toHoleZ) / (curSpeed * toHoleLen);
+                    ball.entryAngle = Math.acos(Math.min(1, Math.abs(dot))) * 180 / Math.PI;
                 }
             }
         }
-        prevHoleDist = dh;
+        ball.prevHoleDist = dh;
 
         // Lateral deviation from start→hole line + break apex tracking
-        const sx = metricsShotStart.x, sz = metricsShotStart.z;
+        const sx = ball.metricsShotStart.x, sz = ball.metricsShotStart.z;
         const lx = -sx, lz = -sz;
         const lineLen = Math.hypot(lx, lz);
         if (lineLen > 0.01) {
             const cross = Math.abs((newX - sx) * lz - (newZ - sz) * lx) / lineLen;
-            if (cross > maxLateralDev) {
-                maxLateralDev = cross;
-                breakApexTravelDist = travelDist;
+            if (cross > ball.maxLateralDev) {
+                ball.maxLateralDev = cross;
+                ball.breakApexTravelDist = ball.travelDist;
             }
         }
     }
 
     // Ball rotation (quaternion)
     if (distMoved > 1e-6) {
-        const mx = newX - ballPos[0], mz = newZ - ballPos[2];
+        const mx = newX - ball.pos[0], mz = newZ - ball.pos[2];
         const axisVec = new THREE.Vector3(-mz / distMoved, 0, mx / distMoved);
         const rotAngle = -distMoved / BALL_RADIUS_M;
         const dq = new THREE.Quaternion().setFromAxisAngle(axisVec, rotAngle);
@@ -3399,7 +3633,7 @@ function updatePhysics(dt) {
     }
 
     // Tunneling detection
-    const oldX = ballPos[0], oldZ = ballPos[2];
+    const oldX = ball.pos[0], oldZ = ball.pos[2];
     const segDx = newX - oldX, segDz = newZ - oldZ;
     const segLenSq = segDx * segDx + segDz * segDz;
     let closestDist;
@@ -3407,55 +3641,55 @@ function updatePhysics(dt) {
         const tc = Math.max(0, Math.min(1, -(oldX * segDx + oldZ * segDz) / segLenSq));
         closestDist = Math.hypot(oldX + tc * segDx, oldZ + tc * segDz);
     } else {
-        closestDist = Math.hypot(newX, newZ);
+        closestDist = distToHole(newX, newZ);
     }
 
     // Commit new position
-    ballPos[0] = newX;
-    ballPos[1] = newY;
-    ballPos[2] = newZ;
+    ball.pos[0] = newX;
+    ball.pos[1] = newY;
+    ball.pos[2] = newZ;
 
     // Game mode: out of bounds check (6m from hole)
-    const distToHole = Math.hypot(ballPos[0], ballPos[2]);
-    if (gameState === 'moving' && distToHole > GAME_OOB_DIST) {
-        ballMoving = false;
-        ballVel = [0, 0, 0];
+    const dthCur = distToHole(ball.pos[0], ball.pos[2]);
+    if (gameCtx.state === 'moving' && dthCur > GAME_OOB_DIST) {
+        ball.moving = false;
+        ball.vel = [0, 0, 0];
         scoreShot(true);
         return;
     }
 
     // Hole capture check
     const holeBottom = -holeDepth + BALL_RADIUS_M;
-    const speedXz = Math.hypot(ballVel[0], ballVel[2]);
-    const crossedHole = closestDist <= HOLE_RADIUS_M && !ballAirborne;
-    const ballDroppedIn = (distToHole <= HOLE_RADIUS_M + BALL_RADIUS_M) && ballPos[1] < BALL_RADIUS_M * 0.5;
+    const speedXz = Math.hypot(ball.vel[0], ball.vel[2]);
+    const crossedHole = closestDist <= HOLE_RADIUS_M && !ball.airborne;
+    const ballDroppedIn = (dthCur <= HOLE_RADIUS_M + BALL_RADIUS_M) && ball.pos[1] < BALL_RADIUS_M * 0.5;
 
     // Track ball crossing hole for game lip-out detection
-    if (gameState === 'moving' && (crossedHole || distToHole <= HOLE_RADIUS_M)) {
-        gameCrossedHole = true;
+    if (gameCtx.state === 'moving' && (crossedHole || dthCur <= HOLE_RADIUS_M)) {
+        gameCtx.crossedHole = true;
     }
 
-    if (ballDroppedIn || distToHole <= HOLE_RADIUS_M || crossedHole) {
-        if (ballDroppedIn || (!ballAirborne && speedXz < 1.45)) {
+    if (ballDroppedIn || dthCur <= HOLE_RADIUS_M || crossedHole) {
+        if (ballDroppedIn || (!ball.airborne && speedXz < 1.45)) {
             // Captured — save state for ghost simulation before zeroing
-            const ghostPos = [ballPos[0], ballPos[1], ballPos[2]];
-            const ghostVel = [ballVel[0], ballVel[1], ballVel[2]];
-            const ghostSpin = ballSpin;
+            const ghostPos = [ball.pos[0], ball.pos[1], ball.pos[2]];
+            const ghostVel = [ball.vel[0], ball.vel[1], ball.vel[2]];
+            const ghostSpin = ball.spin;
 
-            ballMoving = false;
-            ballVel = [0, 0, 0];
-            if (crossedHole && distToHole > HOLE_RADIUS_M) {
-                ballPos[0] = 0; ballPos[2] = 0;
+            ball.moving = false;
+            ball.vel = [0, 0, 0];
+            if (crossedHole && dthCur > HOLE_RADIUS_M) {
+                ball.pos[0] = holeX; ball.pos[2] = holeZ;
             }
-            ballPos[1] = holeBottom;
-            inHole = true;
+            ball.pos[1] = holeBottom;
+            ball.inHole = true;
 
             // Ghost rest position (where ball would stop without hole)
-            const rest = simulateGhostRest(ghostPos, ghostVel, ghostSpin);
+            const rest = simulateGhostRest(ghostPos, ghostVel, ghostSpin, { angleDeg: env.angleDeg, stimpM: env.stimpM });
             placeGhostCross(rest.x, rest.z);
 
             // Valid only if ghost would have stopped within 40cm of hole
-            const ghostDist = Math.hypot(rest.x, rest.z);
+            const ghostDist = distToHole(rest.x, rest.z);
             const validHoleIn = ghostDist <= MAX_GHOST_DIST;
             if (validHoleIn) {
                 aimDot.material.color.setHex(0x1a7ae6); // blue — valid hole-in
@@ -3466,52 +3700,54 @@ function updatePhysics(dt) {
             }
 
             // Game mode scoring on hole-in (only if valid)
-            if (gameState === 'moving') scoreShot(false, !validHoleIn);
+            if (gameCtx.state === 'moving') scoreShot(false, !validHoleIn);
             else setGuide(GUIDE.IN_HOLE);
-        } else if (distToHole <= HOLE_RADIUS_M) {
+        } else if (dthCur <= HOLE_RADIUS_M) {
             // Lip-out
-            ballVel[0] *= 0.92;
-            ballVel[2] *= 0.92;
+            ball.vel[0] *= 0.92;
+            ball.vel[2] *= 0.92;
         }
-    } else if (speedXz < 0.02 && !ballAirborne) {
-        ballMoving = false;
-        ballVel = [0, 0, 0];
+    } else if (speedXz < 0.02 && !ball.airborne) {
+        ball.moving = false;
+        ball.vel = [0, 0, 0];
         colorLastAimPoint(false);
         // Game mode scoring on miss/near
-        if (gameState === 'moving') scoreShot(false);
+        if (gameCtx.state === 'moving') scoreShot(false);
         else setGuide(GUIDE.AIM);
     } else {
         // Don't trace trail inside the hole
-        const dTrail = Math.hypot(ballPos[0], ballPos[2]);
+        const dTrail = distToHole(ball.pos[0], ball.pos[2]);
         if (dTrail > HOLE_RADIUS_M) {
-            const trailSpd = Math.hypot(ballVel[0], ballVel[2]);
-            const trailRatio = initialSpeed > 0 ? trailSpd / initialSpeed : 0;
-            addTrailPoint(ballPos[0], ballPos[1], ballPos[2], trailRatio);
-            emitTrailParticles(ballPos[0], ballPos[1], ballPos[2], trailRatio);
+            const trailSpd = Math.hypot(ball.vel[0], ball.vel[2]);
+            const trailRatio = ball.initialSpeed > 0 ? trailSpd / ball.initialSpeed : 0;
+            addTrailPoint(ball.pos[0], ball.pos[1], ball.pos[2], trailRatio);
+            emitTrailParticles(ball.pos[0], ball.pos[1], ball.pos[2], trailRatio);
         }
     }
 
     // Break point detection (vz sign change)
-    if (ballMoving && !breakLocked && !inHole && !ballAirborne) {
-        const vz = ballVel[2];
-        if (prevVz !== null) {
-            if ((prevVz < 0 && vz >= 0) || (prevVz > 0 && vz <= 0)) {
-                const denom = prevVz - vz;
-                const t = Math.abs(denom) > 1e-6 ? prevVz / denom : 0;
-                const bpx = prevPosForVz[0] + (ballPos[0] - prevPosForVz[0]) * t;
-                const bpz = prevPosForVz[1] + (ballPos[2] - prevPosForVz[1]) * t;
-                breakPoints.push([[bpx, bpz], [-vz, ballVel[0]]]);
-                breakLocked = true;
+    if (ball.moving && !ball.breakLocked && !ball.inHole && !ball.airborne) {
+        const vz = ball.vel[2];
+        if (ball.prevVz !== null) {
+            if ((ball.prevVz < 0 && vz >= 0) || (ball.prevVz > 0 && vz <= 0)) {
+                const denom = ball.prevVz - vz;
+                const t = Math.abs(denom) > 1e-6 ? ball.prevVz / denom : 0;
+                const bpx = ball.prevPosForVz[0] + (ball.pos[0] - ball.prevPosForVz[0]) * t;
+                const bpz = ball.prevPosForVz[1] + (ball.pos[2] - ball.prevPosForVz[1]) * t;
+                ball.breakPoints.push([[bpx, bpz], [-vz, ball.vel[0]]]);
+                ball.breakLocked = true;
                 rebuildBreakMarkers();
             } else if (Math.abs(vz) <= 0.01) {
-                breakPoints.push([[ballPos[0], ballPos[2]], [-vz, ballVel[0]]]);
-                breakLocked = true;
+                ball.breakPoints.push([[ball.pos[0], ball.pos[2]], [-vz, ball.vel[0]]]);
+                ball.breakLocked = true;
                 rebuildBreakMarkers();
             }
         }
-        prevVz = vz;
-        prevPosForVz = [ballPos[0], ballPos[2]];
+        ball.prevVz = vz;
+        ball.prevPosForVz = [ball.pos[0], ball.pos[2]];
     }
+
+    } // end sub-step loop
 }
 
 // ===================================================================
@@ -3519,6 +3755,42 @@ function updatePhysics(dt) {
 // ===================================================================
 const _raycaster = new THREE.Raycaster();
 const _invMatrix = new THREE.Matrix4();
+
+// ---- Place Hole mode (GLB only) ----
+document.getElementById('glb-place-hole').addEventListener('click', () => {
+    placingHole = !placingHole;
+    document.getElementById('glb-place-hole').textContent =
+        placingHole ? 'Click terrain…' : 'Place Hole';
+    document.getElementById('glb-place-hole').style.color = placingHole ? '#ffe033' : '';
+});
+
+document.getElementById('glb-calibrate').addEventListener('click', calibrateGLB);
+
+// Resolve a screen NDC coordinate to a world-space XZ position on the terrain.
+// In GLB mode: raycasts against the actual mesh surface for accurate XZ.
+// In procedural mode: intersects the Y=0 ground plane.
+function resolveAimPoint(ndc) {
+    _raycaster.setFromCamera(ndc, camera);
+
+    if (glbCtx.mode && glbCtx.sceneRoot) {
+        const hits = _raycaster.intersectObject(glbCtx.sceneRoot, true);
+        if (hits.length > 0) {
+            // Transform hit point from world space to worldGroup local space
+            const localPt = hits[0].point.clone().applyMatrix4(_invMatrix.copy(worldGroup.matrixWorld).invert());
+            return { x: localPt.x, z: localPt.z };
+        }
+        return null;
+    }
+
+    // Procedural mode: intersect Y=0 plane in worldGroup local space
+    _invMatrix.copy(worldGroup.matrixWorld).invert();
+    const origin = _raycaster.ray.origin.clone().applyMatrix4(_invMatrix);
+    const dir    = _raycaster.ray.direction.clone().transformDirection(_invMatrix);
+    if (Math.abs(dir.y) < 1e-10) return null;
+    const t = -origin.y / dir.y;
+    if (t <= 0) return null;
+    return { x: origin.x + t * dir.x, z: origin.z + t * dir.z };
+}
 
 function updateAim() {
     // When aimLocked, the aimpoint is fixed — don't follow the mouse
@@ -3553,8 +3825,6 @@ window.addEventListener('resize', () => {
 // ===================================================================
 // RENDER LOOP
 // ===================================================================
-ballMesh.position.set(ballPos[0], ballPos[1], ballPos[2]);
-
 let lastTime = performance.now();
 
 function animate() {
@@ -3565,24 +3835,33 @@ function animate() {
     lastTime = now;
     dt = Math.min(dt, 1 / 30); // Clamp to avoid huge steps after tab switch
 
+    // ---- Calibration animation (GLB physics calibration — marker ball rolling) ----
+    if (calibAnim) {
+        updateCalibAnim();
+        worldGroup.rotation.x = env.angleDeg * Math.PI / 180;
+        controls.update();
+        renderer.render(scene, camera);
+        return;
+    }
+
     // ---- Held keys ----
-    if (!gameState) {
-        if (keysHeld['ArrowUp'])   angleDeg = Math.max(-ANGLE_MAX_DEG, angleDeg - ANGLE_STEP_DEG);
-        if (keysHeld['ArrowDown']) angleDeg = Math.min(ANGLE_MAX_DEG, angleDeg + ANGLE_STEP_DEG);
+    if (!gameCtx.state) {
+        if (keysHeld['ArrowUp'])   env.angleDeg = Math.max(-ANGLE_MAX_DEG, env.angleDeg - ANGLE_STEP_DEG);
+        if (keysHeld['ArrowDown']) env.angleDeg = Math.min(ANGLE_MAX_DEG, env.angleDeg + ANGLE_STEP_DEG);
         if (keysHeld['q'] || keysHeld['Q']) setTrueRollStrength(Math.max(0, getTrueRollStrength() - 0.1));
         if (keysHeld['w'] || keysHeld['W']) setTrueRollStrength(Math.min(4, getTrueRollStrength() + 0.1));
     }
 
-    if (!ballMoving && ballOnCircle) {
+    if (!ball.moving && ball.onCircle) {
         if (keysHeld['ArrowLeft']) {
-            ballAngle += 0.035;
-            lastCircleAngle = ballAngle;
+            ball.angle += 0.035;
+            ball.lastCircleAngle = ball.angle;
             updateBallOnCircle();
             clearHint();
         }
         if (keysHeld['ArrowRight']) {
-            ballAngle -= 0.035;
-            lastCircleAngle = ballAngle;
+            ball.angle -= 0.035;
+            ball.lastCircleAngle = ball.angle;
             updateBallOnCircle();
             clearHint();
         }
@@ -3595,52 +3874,52 @@ function animate() {
     updateAim();
 
     // ---- Overlay updates ----
-    if (flowMode === 1) {
-        if (Math.abs(angleDeg - flowLastAngle) > 0.3 || Math.abs(stimpM - flowLastStimp) > 0.2) {
+    if (viz.flowMode === 1) {
+        if (Math.abs(env.angleDeg - flowLastAngle) > 0.3 || Math.abs(env.stimpM - flowLastStimp) > 0.2) {
             rebuildFlowVisuals();
         }
         updateFlowParticles(dt);
     }
-    if (flowMode === 2) {
-        if (Math.abs(angleDeg - gridFlowLastAngle) > 0.3 || Math.abs(stimpM - gridFlowLastStimp) > 0.2) {
+    if (viz.flowMode === 2) {
+        if (Math.abs(env.angleDeg - gridFlowLastAngle) > 0.3 || Math.abs(env.stimpM - gridFlowLastStimp) > 0.2) {
             rebuildGridFlow();
         }
         updateGridFlowParticles(dt);
     }
-    if (flowMode === 3 && Math.abs(angleDeg - gradientLastAngle) > 0.3) {
+    if (viz.flowMode === 3 && Math.abs(env.angleDeg - gradientLastAngle) > 0.3) {
         buildGradientArrows();
-        gradientLastAngle = angleDeg;
+        gradientLastAngle = env.angleDeg;
     }
-    if (Math.abs(angleDeg - (slopeIndicatorGroup._lastAngle || 0)) > 0.05) {
+    if (Math.abs(env.angleDeg - (slopeIndicatorGroup._lastAngle || 0)) > 0.05) {
         rebuildSlopeIndicator();
-        slopeIndicatorGroup._lastAngle = angleDeg;
+        slopeIndicatorGroup._lastAngle = env.angleDeg;
     }
 
     // ---- World slope rotation ----
-    worldGroup.rotation.x = angleDeg * Math.PI / 180;
+    worldGroup.rotation.x = env.angleDeg * Math.PI / 180;
 
     // ---- Ball mesh ----
-    ballMesh.position.set(ballPos[0], ballPos[1], ballPos[2]);
+    ballMesh.position.set(ball.pos[0], ball.pos[1], ball.pos[2]);
 
     // ---- Ball shadow ----
     {
-        const groundY = getTerrainHeight(ballPos[0], ballPos[2]);
-        ballShadow.position.set(ballPos[0], groundY + 0.002, ballPos[2]);
-        const heightAbove = Math.max(0, ballPos[1] - BALL_RADIUS_M - groundY);
+        const groundY = getTerrainHeight(ball.pos[0], ball.pos[2]);
+        ballShadow.position.set(ball.pos[0], groundY + 0.002, ball.pos[2]);
+        const heightAbove = Math.max(0, ball.pos[1] - BALL_RADIUS_M - groundY);
         const scale = 1.0 + heightAbove * 2.0;
         ballShadow.scale.setScalar(scale);
         shadowMat.opacity = Math.max(0.08, 0.35 - heightAbove * 0.5);
-        ballShadow.visible = !inHole;
+        ballShadow.visible = !ball.inHole;
     }
 
     // ---- Aim line / dot ----
     // aimDot is red when actively aiming (new click), yellow after a shot
     aimDot.visible = true;
     aimDot.position.set(aimWorld.x, aimWorld.y + 0.02, aimWorld.z);
-    if (!ballMoving) {
+    if (!ball.moving) {
         aimLine.visible = true;
         const p = aimLine.geometry.attributes.position.array;
-        p[0] = ballPos[0]; p[1] = ballPos[1]; p[2] = ballPos[2];
+        p[0] = ball.pos[0]; p[1] = ball.pos[1]; p[2] = ball.pos[2];
         p[3] = aimWorld.x;  p[4] = aimWorld.y + 0.005; p[5] = aimWorld.z;
         aimLine.geometry.attributes.position.needsUpdate = true;
     } else {
@@ -3648,7 +3927,6 @@ function animate() {
     }
 
     // ---- HUD ----
-    updateSky(dt);
     updateTrailParticles();
     updateHUD();
     drawSpeedChart();
@@ -3667,6 +3945,35 @@ function animate() {
     renderer.render(scene, camera);
 }
 
-animate();
-setGuide(GUIDE.WELCOME);
-console.log('Putting Simulator - Phase 3 loaded');
+// ===================================================================
+// ENTRY POINT — all side-effectful initialisation in one place
+// ===================================================================
+function init() {
+    // 1. Physics/terrain grids
+    buildTrueRollGrids(null);
+
+    // 2. Visual scene objects
+    greenMesh = buildGreenMesh();
+    worldGroup.add(greenMesh);
+    decorGroup = buildDecor();
+    holeGroup = buildHole();
+    worldGroup.add(holeGroup);
+    ballMesh = buildBall();
+    worldGroup.add(ballMesh);
+    worldGroup.add(ballShadow);
+    worldGroup.add(trailGroup);
+
+    // 3. Proper ball starting position (needs terrain height + ballMesh)
+    ball.pos = [ball.circleRadius, getTerrainHeight(ball.circleRadius, 0) + BALL_RADIUS_M, 0];
+    ballMesh.position.set(ball.pos[0], ball.pos[1], ball.pos[2]);
+
+    // 4. Sync UI sliders to initial state values
+    syncSlidersFromState();
+
+    // 5. Start render loop and set welcome message
+    animate();
+    setGuide(GUIDE.WELCOME);
+    console.log('Putting Simulator - Phase 3 loaded');
+}
+
+init();

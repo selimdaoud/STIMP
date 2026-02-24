@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Green Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1c2535; overflow: hidden; font-family: 'Courier New', monospace; color: #ebebeb; }
+  canvas { display: block; cursor: crosshair; }
+  #ui {
+    position: absolute; top: 20px; left: 20px;
+    display: flex; flex-direction: column; gap: 10px; z-index: 10;
+  }
+  #btn-load {
+    padding: 12px 22px;
+    border: 2px solid #7ec8ff; border-radius: 8px;
+    background: rgba(20,23,28,0.92); color: #7ec8ff;
+    font-family: 'Courier New', monospace; font-size: 15px; cursor: pointer;
+  }
+  #btn-load:hover { background: rgba(126,200,255,0.12); }
+  #file-input { display: none; }
+  #status {
+    font-size: 11px; color: rgba(255,255,255,0.45);
+    line-height: 1.7; white-space: pre-line;
+  }
+  #info {
+    position: absolute; bottom: 20px; left: 20px;
+    font-size: 11px; color: rgba(255,255,255,0.3);
+    line-height: 1.7; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <button id="btn-load">&#x1F4C2; Load GLB…</button>
+  <input type="file" id="file-input" accept=".glb,.gltf">
+  <div id="status">No file loaded.</div>
+</div>
+
+<div id="info">
+  Look: drag &nbsp;|&nbsp; Zoom: wheel<br>
+  Move: WASD / QE &nbsp;|&nbsp; Slow: Shift
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ---- Renderer ----
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.prepend(renderer.domElement);
+
+// ---- Scene ----
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1c2535);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 500);
+camera.position.set(0, 8, 10);
+camera.lookAt(0, 0, 0);
+
+// ---- Lights ----
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const sun = new THREE.DirectionalLight(0xfff4e0, 1.2);
+sun.position.set(10, 15, 6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.near   = 0.5;
+sun.shadow.camera.far    = 100;
+sun.shadow.camera.left   = -15;
+sun.shadow.camera.right  =  15;
+sun.shadow.camera.top    =  15;
+sun.shadow.camera.bottom = -15;
+scene.add(sun);
+
+// ---- Grid ----
+const grid = new THREE.GridHelper(20, 20, 0x334455, 0x223344);
+grid.position.y = -0.01;
+scene.add(grid);
+
+// ---- First-person camera state ----
+// Euler angles driving the camera rotation (YXZ = yaw then pitch, no roll)
+let fpYaw   = 0;
+let fpPitch = 0;
+
+function syncFPFromCamera() {
+    // Extract current yaw/pitch from camera quaternion
+    const e = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+    fpYaw   = e.y;
+    fpPitch = e.x;
+}
+syncFPFromCamera();
+
+function applyFPRotation() {
+    camera.quaternion.setFromEuler(new THREE.Euler(fpPitch, fpYaw, 0, 'YXZ'));
+}
+
+// Mouse look
+let isDragging = false;
+let lastX = 0, lastY = 0;
+const LOOK_SPEED = 0.003;
+
+renderer.domElement.addEventListener('mousedown', e => {
+    isDragging = true;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    renderer.domElement.style.cursor = 'grabbing';
+});
+window.addEventListener('mouseup', () => {
+    isDragging = false;
+    renderer.domElement.style.cursor = 'crosshair';
+});
+window.addEventListener('mousemove', e => {
+    if (!isDragging) return;
+    fpYaw   -= (e.clientX - lastX) * LOOK_SPEED;
+    fpPitch -= (e.clientY - lastY) * LOOK_SPEED;
+    fpPitch  = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, fpPitch));
+    lastX = e.clientX;
+    lastY = e.clientY;
+    applyFPRotation();
+});
+
+// Wheel = move forward/backward along look direction
+const _wFwd = new THREE.Vector3();
+renderer.domElement.addEventListener('wheel', e => {
+    camera.getWorldDirection(_wFwd);
+    camera.position.addScaledVector(_wFwd, -e.deltaY * 0.05);
+}, { passive: true });
+
+// ---- GLB Loader ----
+let currentModel = null;
+
+function loadGLB(file) {
+    const status = document.getElementById('status');
+    status.textContent = `Loading ${file.name}…`;
+
+    const url = URL.createObjectURL(file);
+    new GLTFLoader().load(
+        url,
+        (gltf) => {
+            URL.revokeObjectURL(url);
+
+            if (currentModel) { scene.remove(currentModel); currentModel = null; }
+            currentModel = gltf.scene;
+
+            currentModel.traverse(o => {
+                if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; }
+            });
+
+            // Center model at origin
+            const box    = new THREE.Box3().setFromObject(currentModel);
+            const center = box.getCenter(new THREE.Vector3());
+            const size   = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+
+            currentModel.position.sub(center);
+            scene.add(currentModel);
+
+            // Large models: camera inside — Small models: camera outside
+            if (maxDim > 50) {
+                camera.position.set(0, 0, 1);
+                camera.far = maxDim * 3;
+                grid.visible = false;
+            } else {
+                currentModel.position.y += size.y / 2;
+                camera.position.set(0, maxDim * 1.1, maxDim * 1.5);
+                camera.far = Math.max(500, maxDim * 10);
+                grid.visible = true;
+                grid.position.y = 0;
+            }
+            camera.updateProjectionMatrix();
+            camera.lookAt(0, 0, 0);
+            syncFPFromCamera();   // sync yaw/pitch to new camera orientation
+
+            const meshNames = [];
+            currentModel.traverse(o => { if (o.isMesh && o.name) meshNames.push(o.name); });
+
+            status.textContent =
+                `File: ${file.name}\n` +
+                `Size: ${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)} m\n` +
+                `Meshes: ${meshNames.length}` +
+                (meshNames.length ? '\n  ' + meshNames.join('\n  ') : '');
+        },
+        undefined,
+        (err) => {
+            URL.revokeObjectURL(url);
+            status.textContent = 'Error: ' + (err.message || err);
+        }
+    );
+}
+
+document.getElementById('btn-load').addEventListener('click', () => {
+    document.getElementById('file-input').click();
+});
+document.getElementById('file-input').addEventListener('change', (e) => {
+    if (e.target.files[0]) loadGLB(e.target.files[0]);
+    e.target.value = '';
+});
+
+// ---- WASD movement ----
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.code] = true; });
+window.addEventListener('keyup',   e => { keys[e.code] = false; });
+window.addEventListener('blur',    () => { for (const k in keys) keys[k] = false; });
+
+const _moveDir = new THREE.Vector3();
+const _right   = new THREE.Vector3();
+const _delta   = new THREE.Vector3();
+const _up      = new THREE.Vector3(0, 1, 0);
+
+function applyWASD() {
+    const anyKey = keys['KeyW'] || keys['KeyS'] || keys['KeyA'] ||
+                   keys['KeyD'] || keys['KeyQ'] || keys['KeyE'];
+    if (!anyKey) return;
+
+    const speed = keys['ShiftLeft'] || keys['ShiftRight'] ? 0.03 : 0.3;
+
+    camera.getWorldDirection(_moveDir);
+    _right.crossVectors(_moveDir, _up).normalize();
+
+    _delta.set(0, 0, 0);
+    if (keys['KeyW']) _delta.addScaledVector(_moveDir,  speed);
+    if (keys['KeyS']) _delta.addScaledVector(_moveDir, -speed);
+    if (keys['KeyA']) _delta.addScaledVector(_right,   -speed);
+    if (keys['KeyD']) _delta.addScaledVector(_right,    speed);
+    if (keys['KeyE']) _delta.y += speed;
+    if (keys['KeyQ']) _delta.y -= speed;
+
+    camera.position.add(_delta);
+}
+
+// ---- Resize ----
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---- Render loop ----
+(function animate() {
+    requestAnimationFrame(animate);
+    applyWASD();
+    renderer.render(scene, camera);
+})();
+</script>
+</body>
+</html>

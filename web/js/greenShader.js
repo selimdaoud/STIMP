@@ -76,10 +76,11 @@ const fragmentShader = /* glsl */ `
 
     // ---- Procedural grass color driven by terrain elevation ----
     vec3 grassColor(vec2 uv, float elevation) {
-        vec3 grassDark      = vec3(0.22, 0.26, 0.12);
-        vec3 grassMid       = vec3(0.30, 0.36, 0.15);
-        vec3 grassLight     = vec3(0.36, 0.42, 0.18);
-        vec3 grassVeryLight = vec3(0.40, 0.46, 0.20);
+        // Warmer, more saturated greens (yellow-green like healthy turf)
+        vec3 grassDark      = vec3(0.22, 0.28, 0.09);
+        vec3 grassMid       = vec3(0.30, 0.39, 0.11);
+        vec3 grassLight     = vec3(0.38, 0.47, 0.14);
+        vec3 grassVeryLight = vec3(0.44, 0.54, 0.17);
 
         // Elevation drives the main tone (remap from typical range to 0..1)
         // HEIGHT_SCALE=0.02, TARGET_AMP=0.1 → heights roughly -0.002..+0.002
@@ -102,6 +103,13 @@ const fragmentShader = /* glsl */ `
         float finDetail   = noise(uv * 80.0) * 0.2 + noise(uv * 120.0) * 0.15;
         float microDetail = noise(uv * 300.0) * 0.08;
         color += (finDetail + microDetail) * 0.015;
+
+        // Mowing stripes — ~0.45m wide alternating light/dark bands along world X
+        // uv = worldXZ * 2.5, so worldX = uv.x / 2.5
+        float worldX = uv.x / 2.5;
+        float stripeT = sin(worldX * (3.14159 / 0.45)) * 0.5 + 0.5;
+        stripeT = smoothstep(0.25, 0.75, stripeT);  // soften band edge
+        color *= mix(0.99, 1.10, stripeT);
 
         return color;
     }
@@ -199,9 +207,9 @@ const fragmentShader = /* glsl */ `
         float heightShadow = heightMap(uv);
         heightShadow = mix(0.95, 1.0, heightShadow);
 
-        // Collar — slightly darker near the edge
-        float edgeBand = smoothstep(-1.0, -0.1, greenSd);
-        vec3 collarTint = mix(vec3(0.86, 0.90, 0.82), vec3(1.0), edgeBand);
+        // Fringe — noticeably darker near the organic edge (longer rough look)
+        float edgeBand = smoothstep(-1.4, -0.05, greenSd);
+        vec3 collarTint = mix(vec3(0.52, 0.60, 0.42), vec3(1.0), edgeBand);
 
         vec3 finalColor = (ambient + diffuse * uEnDiffuse + specular * uEnSpecular + fresnelSpecular * uEnFresnel) * heightShadow * collarTint;
 
@@ -221,7 +229,7 @@ export function createGreenMaterial(seedA, seedB) {
         vertexShader,
         fragmentShader,
         uniforms: {
-            uLightPos:     { value: new THREE.Vector3(5, 10, 5) },
+            uLightPos:     { value: new THREE.Vector3(10, 4, 2) },  // lateral low sun
             uViewPos:      { value: new THREE.Vector3(0, 5, 10) },
             uShapeSeedA:   { value: new THREE.Vector4(seedA[0], seedA[1], seedA[2], seedA[3]) },
             uShapeSeedB:   { value: new THREE.Vector4(seedB[0], seedB[1], seedB[2], seedB[3]) },

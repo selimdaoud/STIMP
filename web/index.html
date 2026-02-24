@@ -77,6 +77,16 @@
   }
   #flow-btn:active { background: rgba(60, 65, 75, 0.9); }
 
+  /* ---- GLB position panel ---- */
+  .side-panel.glb-hidden { display: none; }
+  #panel-glb .panel-content button {
+    padding: 5px 10px; border: 1px solid rgba(255,255,255,0.2); border-radius: 5px;
+    background: rgba(40,45,55,0.9); color: #ebebeb;
+    font-family: 'Courier New', monospace; font-size: 11px; cursor: pointer;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+  }
+  #panel-glb .panel-content button:active { background: rgba(80,85,95,0.9); }
+
   /* ---- Action buttons ---- */
   #action-btns {
     position: absolute; bottom: 20px; left: 20px;
@@ -183,39 +193,62 @@
     border-radius: 8px; pointer-events: none; z-index: 25; display: none;
   }
 
-  /* ---- Side panels (right) ---- */
+  /* ---- Sidebar (Blender N-panel style) ---- */
+  #sidebar {
+    position: fixed; right: 0; top: 0;
+    height: 100%; width: 220px; z-index: 20;
+    transition: transform 0.25s ease;
+    pointer-events: none;
+  }
+  #sidebar.hidden { transform: translateX(100%); }
+  #sidebar-tab {
+    position: absolute; left: -22px; top: 50%; transform: translateY(-50%);
+    width: 22px; height: 52px;
+    background: rgba(20,23,28,0.88); color: #ffe033;
+    border: 1px solid rgba(255,255,255,0.2); border-right: none;
+    border-radius: 6px 0 0 6px;
+    font-size: 13px; cursor: pointer; pointer-events: auto;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #sidebar:not(.hidden) #sidebar-tab { transform: translateY(-50%) scaleX(-1); }
   #panels-container {
-    position: absolute; right: 0; top: 50%; transform: translateY(-50%);
-    display: flex; flex-direction: column; gap: 5px;
-    padding: 8px 0; z-index: 20; pointer-events: none; overflow: visible;
+    width: 100%; height: 100%;
+    display: flex; flex-direction: column;
+    overflow-y: auto; overflow-x: hidden;
+    background: rgba(20,23,28,0.92);
+    border-left: 1px solid rgba(255,255,255,0.15);
+    pointer-events: auto;
   }
   .side-panel {
-    display: flex; flex-direction: row; align-items: stretch;
-    pointer-events: auto; transition: transform 0.25s ease;
+    display: flex; flex-direction: column;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
   }
-  .side-panel.collapsed { transform: translateX(calc(100% - 36px)); }
-  .side-panel.collapsed .panel-content { pointer-events: none; opacity: 0; }
+  .side-panel.glb-hidden { display: none; }
   .panel-toggle {
-    width: 36px;
-    border: 1px solid rgba(255,255,255,0.2); border-right: none;
-    border-radius: 8px 0 0 8px;
-    background: rgba(20, 23, 28, 0.85); color: #ebebeb;
-    cursor: pointer; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; gap: 6px; padding: 8px 0;
+    width: 100%; padding: 8px 12px;
+    background: rgba(30,34,42,0.95); color: #ebebeb;
+    border: none; cursor: pointer;
+    display: flex; flex-direction: row; align-items: center; gap: 8px;
     touch-action: manipulation; -webkit-tap-highlight-color: transparent; user-select: none;
   }
-  .panel-arr { font-size: 16px; }
+  .panel-toggle:hover { background: rgba(50,55,65,0.95); }
+  .panel-arr {
+    font-size: 9px; color: #ffe033;
+    transition: transform 0.2s; display: inline-block;
+  }
+  .side-panel.open .panel-arr { transform: rotate(90deg); }
   .panel-lbl {
-    font-family: 'Courier New', monospace; font-size: 8px; color: #ffe033;
-    writing-mode: vertical-rl; transform: rotate(180deg); letter-spacing: 1px;
+    font-family: 'Courier New', monospace; font-size: 11px; color: #ebebeb;
+    letter-spacing: 1px; writing-mode: unset; transform: none;
   }
   .panel-content {
-    width: 200px; padding: 10px 10px;
-    background: rgba(20, 23, 28, 0.9);
-    border: 1px solid rgba(255,255,255,0.15);
+    max-height: 0; overflow: hidden;
+    transition: max-height 0.25s ease;
+    padding: 0 10px;
     display: flex; flex-direction: column; gap: 10px;
-    touch-action: none; transition: opacity 0.2s;
+    background: rgba(20,23,28,0.95);
   }
+  .side-panel.open .panel-content { max-height: 800px; padding: 10px; }
   .panel-content label { display: flex; flex-direction: column; gap: 4px; }
   .slider-label {
     font-family: 'Courier New', monospace; font-size: 12px; color: #ebebeb;
@@ -344,17 +377,21 @@
 <canvas id="energy-chart" width="800" height="150"></canvas>
 <canvas id="phase-chart"  width="600" height="200"></canvas>
 
+<input type="file" id="glb-terrain-input" accept=".glb,.gltf" style="display:none">
 <div id="action-btns">
   <button data-action="reset">Reset</button>
+  <button data-action="loadGLBTerrain">Load GLB</button>
   <button data-action="newTerrain">New Terrain</button>
   <button data-action="cycleFlow">Flow</button>
   <button data-action="resetCam">Camera</button>
   <button data-action="toggleSpeed">Velocity Profile</button>
   <button data-action="toggleEnergy">Energy Budget</button>
   <button data-action="togglePhase">Phase Space</button>
+  <button data-action="toggleNormals">Normals</button>
 
   <button data-action="startGame">Play</button>
 </div>
+
 
 <div id="dpad">
   <div class="dpad-empty"></div>
@@ -401,9 +438,11 @@
 
 <button id="game-exit-live">Exit Game</button>
 
+<div id="sidebar">
+<button id="sidebar-tab">&#x276F;</button>
 <div id="panels-container">
   <!-- Green panel -->
-  <div class="side-panel collapsed" id="panel-green">
+  <div class="side-panel" id="panel-green">
     <button class="panel-toggle" id="toggle-green"><span class="panel-arr">&#xBB;</span><span class="panel-lbl">GREEN</span></button>
     <div class="panel-content">
       <label>
@@ -433,7 +472,7 @@
     </div>
   </div>
   <!-- Lighting panel -->
-  <div class="side-panel collapsed" id="panel-lighting">
+  <div class="side-panel" id="panel-lighting">
     <button class="panel-toggle" id="toggle-lighting"><span class="panel-arr">&#xBB;</span><span class="panel-lbl">LIGHT</span></button>
     <div class="panel-content">
       <label>
@@ -462,6 +501,44 @@
       </label>
     </div>
   </div>
+
+  <!-- GLB position panel (hidden until a GLB is loaded) -->
+  <div class="side-panel glb-hidden" id="panel-glb">
+    <button class="panel-toggle" id="toggle-glb"><span class="panel-arr">&#xBB;</span><span class="panel-lbl">GLB</span></button>
+    <div class="panel-content">
+      <label>
+        <span class="ld-label">X <span class="ld-val" id="glb-x-val">0.0</span></span>
+        <input type="range" id="glb-x" min="-50" max="50" step="0.1" value="0">
+      </label>
+      <label>
+        <span class="ld-label">Y <span class="ld-val" id="glb-y-val">0.0</span></span>
+        <input type="range" id="glb-y" min="-50" max="50" step="0.1" value="0">
+      </label>
+      <label>
+        <span class="ld-label">Z <span class="ld-val" id="glb-z-val">0.0</span></span>
+        <input type="range" id="glb-z" min="-50" max="50" step="0.1" value="0">
+      </label>
+      <label>
+        <span class="ld-label">Scale <span class="ld-val" id="glb-scale-val">×1.00</span></span>
+        <input type="range" id="glb-scale" min="0.1" max="10" step="0.05" value="1">
+      </label>
+      <button id="glb-pos-reset">Reset pos</button>
+      <button id="glb-flip-z">Flip Z</button>
+      <button id="glb-flip-x">Flip X</button>
+      <button id="glb-place-hole">Place Hole</button>
+      <button id="glb-calibrate">Calibrer physique</button>
+      <div id="glb-calib-result" style="font-family:'Courier New',monospace;font-size:10px;color:#ffe033;min-height:14px;text-align:center;"></div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- Calibration animation overlay -->
+<div id="calib-overlay" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); background:rgba(0,0,0,0.85); border:1.5px solid #ffe033; border-radius:10px; padding:18px 28px; z-index:200; flex-direction:column; align-items:center; gap:8px; font-family:'Courier New',monospace; color:#eee; min-width:220px;">
+  <div id="calib-phase" style="font-size:14px; color:#ffe033; font-weight:bold; text-align:center;">—</div>
+  <div id="calib-speed" style="font-size:12px;">Vitesse : — m/s</div>
+  <div id="calib-dist"  style="font-size:12px;">Distance : — m</div>
+  <div id="calib-summary" style="font-size:11px; color:#ffe033; margin-top:6px; text-align:center;"></div>
 </div>
 
 <script>window.SHOW_LIGHT_DEBUG = true;</script>
